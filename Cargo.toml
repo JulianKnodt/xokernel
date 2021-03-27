@@ -7,9 +7,8 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bootloader = "0.9.8"
+bootloader = "0.9.16"
 x86_64 = "0.13.2"
-scsi = "0.2.1"
 uart_16550 = "0.2.12"
 linked_list_allocator = "0.8.11"
 
@@ -28,9 +27,11 @@ run-command = [
   "qemu-system-x86_64",
   # the kernel itself
   "-drive", "format=raw,file={}",
+  # additional drive for block device
   "-drive", "format=raw,if=none,file=disk,id=disk",
   # An extra virt-io device?
   "-device", "virtio-blk-pci,drive=disk",
+  #"-device", "virtio-blk-device,drive=disk",
   # use UART driver or own window
-  "-nographic",
+  #"-nographic",
 ]

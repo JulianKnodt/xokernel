@@ -1,51 +1,12 @@
-const BLOCK_SIZE: usize = 4096;
-pub trait BlockDevice {
-  fn read(&self, block_num: u32, into: &mut [u8; BLOCK_SIZE]) -> Result<(), ()>;
-  fn write(&self, block_num: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), ()>;
-  fn num_blocks(&self) -> usize;
-}
+use crate::block_interface::{Metadata, GLOBAL_BLOCK_INTERFACE};
 
-pub trait BlockDeviceInterface {
-  fn read(&self, block_num: u32, into: &mut [u8; BLOCK_SIZE]) -> Result<(), ()>;
-  fn write(&self, block_num: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), ()>;
-}
-
-pub trait Metadata {
-  fn new() -> Self;
-  fn owned(&self) -> &[u32];
-  fn insert(&mut self, b: u32) -> Result<(), ()>;
-  fn remove(&mut self, b: u32) -> Result<(), ()>;
-}
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FileDescriptor(u8);
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct INode {
   blocks: [u32; 8],
   in_use: u8,
-}
-
-#[derive(Debug)]
-pub struct BitMap {
-  data: [u8; 512],
-}
-
-impl BitMap {
-  pub fn get(&self, i: usize) -> bool {
-    let idx = i / 8;
-    ((self.data[idx] >> (i % 8)) & 0b1) == 1
-  }
-  pub fn set(&mut self, i: usize) -> bool {
-    let idx = i / 8;
-    let old = ((self.data[idx] >> (i % 8)) & 0b1) == 1;
-    self.data[idx] |= 1 << (i % 8);
-    old
-  }
-  pub fn unset(&mut self, i: usize) -> bool {
-    let idx = i / 8;
-    let old = ((self.data[idx] >> (i % 8)) & 0b1) == 1;
-    self.data[idx] &= !(1 << (i % 8));
-    old
-  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,12 +18,9 @@ struct Superblock {
   num_data: u32,
 }
 
-pub struct FileSystem<B: BlockDevice> {
-  block_device: B,
-  // Fixed size of 4096 blocks
-  free_map: BitMap,
-  file_descriptors: [FileDescriptor; 256],
+pub struct FileSystem {
   superblock: Superblock,
+  file_descriptors: [FileDescriptor; 256],
 }
 
 impl Metadata for INode {
@@ -73,34 +31,27 @@ impl Metadata for INode {
     }
   }
   fn owned(&self) -> &[u32] { &self.blocks[..self.in_use as usize] }
-  fn insert(&mut self, b: u32) -> Result<(), ()> {
-    if self.in_use >= 8 {
+  fn insert(&self, b: u32) -> Result<Self, ()> {
+    if (self.in_use as usize) == self.blocks.len() {
       return Err(());
     }
-    self.in_use += 1;
-    self.blocks[self.in_use as usize - 1] = b;
-    Ok(())
+    let mut out = self.clone();
+    out.blocks[out.in_use as usize] = b;
+    out.in_use += 1;
+    Ok(out)
   }
-  fn remove(&mut self, b: u32) -> Result<(), ()> {
+  fn remove(&self, b: u32) -> Result<Self, ()> {
     if self.in_use == 0 {
       return Err(());
     }
-    self.in_use -= 1;
-    self.blocks[self.in_use as usize] = 0;
-    Ok(())
+    let mut out = self.clone();
+    out.in_use -= 1;
+    out.blocks[out.in_use as usize] = 0;
+    Ok(out)
   }
 }
 
-/*
-// need one block for superblock at beginning
-impl<B: BlockDevice> Metadata for FileSystem<B> {
-  fn owned(&self) -> &[u32] { &[0] }
-  fn insert(&mut self, b: u32) -> Result<(), ()> { return Err(()) }
-  fn remove(&mut self, b: u32) -> Result<(), ()> { return Err(()) }
-}
-*/
-
-impl<B: BlockDevice> FileSystem<B> {
+impl FileSystem {
   pub fn new() -> Self { todo!() }
   pub fn open(&self) -> Result<FileDescriptor, ()> { todo!() }
   pub fn close(&self, fd: FileDescriptor) -> Result<(), ()> { todo!() }

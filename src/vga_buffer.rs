@@ -57,7 +57,6 @@ impl Writer {
   }
 }
 
-static mut TEST: usize = 0;
 impl fmt::Write for Writer {
   fn write_str(&mut self, s: &str) -> fmt::Result {
     for &b in s.as_bytes() {
@@ -79,12 +78,12 @@ pub(crate) fn print_at(val: &[u8], row: usize, col: usize) {
   if col >= MAX_COL {
     return;
   }
-  let start_pos = 2 * (row * MAX_COL + col);
+  let start_pos = row * MAX_COL + col;
   for (i, &b) in val.iter().take(MAX_ROW * MAX_COL - start_pos).enumerate() {
     let p = 2 * (start_pos + i) as isize;
     unsafe {
-      *VGA_BUFFER.offset(p) = b;
-      *VGA_BUFFER.offset(p + 1) = 0xb;
+      VGA_BUFFER.offset(p).write_volatile(b);
+      VGA_BUFFER.offset(p + 1).write_volatile(0xb);
     }
   }
 }

@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+use bootloader::bootinfo::{BootInfo, MemoryRegionType};
 use core::{fmt::Write, panic::PanicInfo};
 use x86_64::{
   structures::{
@@ -29,9 +30,9 @@ use x86_64::{
   VirtAddr,
 };
 
-mod disk;
 mod utils;
 mod vga_buffer;
+mod virtio;
 
 mod fs;
 
@@ -40,24 +41,60 @@ mod block_interface;
 
 mod allocator;
 
+const SETUP_DATA: *const SetupData = 0250u64 as *const SetupData;
+
+#[repr(C)]
+struct SetupData {
+  next: u64,
+  typ: u32,
+  len: u32,
+  data: *const u8,
+}
+
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   cli!();
   vga_buffer::print_at(b"Starting kernel...", 0, 0);
-  init_syscall(0, req_pages as *const usize);
 
   init();
+  vga_buffer::print_at(b"Finished Init", 1, 0);
   allocator::init_heap();
+  vga_buffer::print_at(b"Finished Heap Init", 2, 0);
+
+  let start = b_info
+    .memory_map
+    .iter()
+    .find(|&&mr| mr.region_type == MemoryRegionType::Kernel)
+    .unwrap()
+    .range
+    .start_addr();
+  let v = unsafe { *((start + 0x0250) as *const u64) };
+  write!(vga_buffer::Writer::new(4, 0), "SetupDataType {}", v);
+  /*
+  let dtb = device_tree_paddr;
+  struct DtbHeader {
+      be_magic: u32,
+      be_size: u32,
+  }
+  let header = unsafe { &*(arg0 as *const DtbHeader) };
+  write!(
+    vga_buffer::Writer::new(5, 0),
+    "{:x}",
+    u32::from_be(header.be_magic),
+  );
+  */
 
   loop {}
 }
 
-#[panic_handler]
-fn _panic(_info: &PanicInfo) -> ! { loop {} }
+fn device_tree_init() {
+  const DEVICE_TREE_MAGIC: u32 = 0xd00dfeed;
+}
 
-pub fn sycall(i: usize) {
-  assert!(i < SYSCALL_COUNT);
-  todo!();
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+  vga_buffer::print_at(b"Panicked", 24, 0);
+  loop {}
 }
 
 static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
@@ -100,7 +137,7 @@ pub fn init() {
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: &mut InterruptStackFrame) {
   write!(
-    vga_buffer::Writer::new(2, 0),
+    vga_buffer::Writer::new(6, 0),
     "EXCEPTION: BREAKPOINT {:#?}",
     stack_frame
   );
@@ -111,7 +148,7 @@ extern "x86-interrupt" fn double_fault_handler(
   error_code: u64,
 ) -> ! {
   write!(
-    vga_buffer::Writer::new(2, 0),
+    vga_buffer::Writer::new(6, 0),
     "EXCEPTION: DOUBLE FAULT({}) {:#?}",
     error_code,
     stack_frame
@@ -126,6 +163,7 @@ extern "x86-interrupt" fn syscall_handler(stack_frame: &mut InterruptStackFrame)
   panic!();
 }
 
+/*
 const SYSCALL_COUNT: usize = 32;
 static mut SYSCALLS: [*const usize; SYSCALL_COUNT] = [0 as *const _; SYSCALL_COUNT];
 
@@ -136,7 +174,4 @@ fn init_syscall(i: usize, defn: *const usize) {
     SYSCALLS[i] = defn;
   }
 }
-
-fn req_pages(n: usize) {
-  todo!();
-}
+*/

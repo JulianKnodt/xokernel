@@ -1,6 +1,13 @@
 use alloc::prelude::v1::Box;
 use core::{any::Any, convert::TryInto};
 
+pub trait BlockDevice {
+  const NUM_BLOCKS: usize;
+  const BLOCK_SIZE: usize;
+  fn read(&self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()>;
+  fn write(&self, block_num: u32, src: &[u8]) -> Result<usize, ()>;
+}
+
 /// Represents Disk Metadata for some application
 pub trait Metadata: 'static {
   fn new() -> Self
@@ -60,24 +67,35 @@ where
   }
 }
 
-const MD_SPACE: usize = 256;
-pub struct FSMetadata {
-  // TODO this might need a heap allocator for Box (altho I could just implement it for a
-  // specific Metadata).
+// Number of Metadata items stored in this block interface.
+const MD_SPACE: usize = 512;
+pub struct GlobalBlockInterface<B: BlockDevice>
+where
+  [(); { B::NUM_BLOCKS / 8 }]: , {
   stored: [Option<Box<dyn Metadata>>; MD_SPACE],
 
   // TODO below is the number of blocks, just picked an arbitrary number for now
-  free_map: BitArray<4096>,
+  free_map: BitArray<{ B::NUM_BLOCKS }>,
+
+  // TODO decide whether or not to include a BlockDescriptor sort of thing with an offset?
+  block_device: *mut B,
 }
+
+use crate::virtio::{Driver, DRIVER};
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct MetadataHandle(u32);
 
-static mut FS_METAS: FSMetadata = FSMetadata::new();
+pub static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<Driver> =
+  GlobalBlockInterface::new(unsafe { &mut DRIVER });
 
 fn as_dyn(md: &Box<dyn Metadata>) -> &dyn Any { md }
-impl FSMetadata {
-  const fn new() -> Self {
+
+impl<B: BlockDevice> GlobalBlockInterface<B>
+where
+  [(); { B::NUM_BLOCKS / 8 }]: ,
+{
+  const fn new(block_device: *mut B) -> Self {
     use core::mem::MaybeUninit;
     let mut stored: [MaybeUninit<Option<Box<dyn Metadata>>>; MD_SPACE] =
       MaybeUninit::uninit_array::<MD_SPACE>();
@@ -91,6 +109,7 @@ impl FSMetadata {
     Self {
       stored,
       free_map: BitArray::new(false),
+      block_device,
     }
   }
 
@@ -150,5 +169,35 @@ impl FSMetadata {
     Ok(())
   }
 
-  // TODO add API for removing block from metadata
+  /// Reads from `n`th block of the metadata handle into dst
+  pub fn read(
+    &self,
+    MetadataHandle(i): MetadataHandle,
+    n: usize,
+    dst: &mut [u8],
+  ) -> Result<usize, ()> {
+    let i = i as usize;
+    let md = self.stored.get(i).ok_or(())?;
+    let md = md.as_ref().ok_or(())?;
+    let owned = md.owned();
+    let &b_n = owned.get(n).ok_or(())?;
+
+    unsafe { self.block_device.as_mut().ok_or(())?.read(b_n, dst) }
+  }
+
+  /// Writes to the `n`th block of the metadata handle from src
+  pub fn write(
+    &self,
+    MetadataHandle(i): MetadataHandle,
+    n: usize,
+    src: &[u8],
+  ) -> Result<usize, ()> {
+    let i = i as usize;
+    let md = self.stored.get(i).ok_or(())?;
+    let md = md.as_ref().ok_or(())?;
+    let owned = md.owned();
+    let &b_n = owned.get(n).ok_or(())?;
+
+    unsafe { self.block_device.as_mut().ok_or(())?.write(b_n, src) }
+  }
 }

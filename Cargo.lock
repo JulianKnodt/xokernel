@@ -16,15 +16,9 @@ checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
 
 [[package]]
 name = "bootloader"
-version = "0.9.12"
+version = "0.9.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "452bbab4eae8767805ff09386c9e26d42ceb6964916ab3c64425469342473f91"
-
-[[package]]
-name = "byteorder"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae44d1a3d5a19df61dd0c8beb138458ac2a53a7ac09eba97d55592540004306b"
+checksum = "8cb1dc91ba8f16c89133c569bc2516833a632a654d61d228b16ae8d2bad5ed8a"
 
 [[package]]
 name = "lazy_static"
@@ -58,15 +52,6 @@ name = "scopeguard"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
-
-[[package]]
-name = "scsi"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b26b8b28a40426307b0bdd6abe8fd14b6907b15f35c106e3d27be01f8932bd36"
-dependencies = [
- "byteorder",
-]
 
 [[package]]
 name = "spin"
@@ -110,7 +95,6 @@ dependencies = [
  "bootloader",
  "lazy_static",
  "linked_list_allocator",
- "scsi",
  "uart_16550",
  "x86_64",
 ]
