@@ -1,3 +1,4 @@
+use crate::virtio::{Driver, DRIVER};
 use alloc::prelude::v1::Box;
 use core::{any::Any, convert::TryInto};
 
@@ -17,6 +18,9 @@ pub trait Metadata: 'static {
 
   // TODO possibly add associated error types here
 
+  // TODO maybe add a vectorized version of below instead of allocating one at a time which may
+  // be costly?
+
   // TODO these functions need to be purely deterministic, and thus shouldn't contain any unsafe
   // code which allows for raw-ptr manipulation
   // also need to have a functional interface here, to allow for rollback if there are errors.
@@ -27,6 +31,29 @@ pub trait Metadata: 'static {
   fn remove(&self, b: u32) -> Result<Self, ()>
   where
     Self: Sized;
+
+  fn ser(&self) -> &[u8]
+  where
+    Self: Sized, {
+    unsafe {
+      core::ptr::slice_from_raw_parts(
+        (self as *const Self) as *const u8,
+        core::mem::size_of::<Self>(),
+      )
+      .as_ref()
+      .unwrap()
+    }
+  }
+  /// returns the number of bytes read and an instance of Self
+  fn de(bytes: &[u8]) -> Result<(Self, usize), ()>
+  where
+    Self: Sized, {
+    let len = core::mem::size_of::<Self>();
+    let used = &bytes.get(..len).ok_or(())?;
+    assert!(used.len() == len);
+    let v = unsafe { (used.as_ptr() as *const Self).read() };
+    Ok((v, len))
+  }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,10 +96,13 @@ where
 
 // Number of Metadata items stored in this block interface.
 const MD_SPACE: usize = 512;
+// Metadata currently has no owner
+const NO_OWNER: u8 = u8::MAX;
 pub struct GlobalBlockInterface<B: BlockDevice>
 where
   [(); { B::NUM_BLOCKS / 8 }]: , {
   stored: [Option<Box<dyn Metadata>>; MD_SPACE],
+  owners: [u8; MD_SPACE],
 
   // TODO below is the number of blocks, just picked an arbitrary number for now
   free_map: BitArray<{ B::NUM_BLOCKS }>,
@@ -80,8 +110,6 @@ where
   // TODO decide whether or not to include a BlockDescriptor sort of thing with an offset?
   block_device: *mut B,
 }
-
-use crate::virtio::{Driver, DRIVER};
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct MetadataHandle(u32);
@@ -108,13 +136,14 @@ where
     let stored: [Option<_>; MD_SPACE] = unsafe { core::mem::transmute(stored) };
     Self {
       stored,
+      owners: [NO_OWNER; MD_SPACE],
       free_map: BitArray::new(false),
       block_device,
     }
   }
 
   /// Allocates new metadata inside of the system
-  pub fn new_metadata<M: Metadata>(&mut self) -> Result<MetadataHandle, ()> {
+  pub fn new_metadata<M: Metadata>(&mut self, owner_id: u8) -> Result<MetadataHandle, ()> {
     let md = M::new();
     let starting_owned = md.owned();
     if !starting_owned.is_empty() {
@@ -127,7 +156,18 @@ where
       Some(space) => space,
     };
     self.stored[free_space] = Some(Box::new(md));
+    self.owners[free_space] = owner_id;
     Ok(MetadataHandle(free_space as u32))
+  }
+
+  /// Returns the metadata for a given owner_id, used after rebooting the system.
+  pub fn metadatas_for(&self, owner_id: u8) -> impl Iterator<Item = MetadataHandle> + '_ {
+    self
+      .owners
+      .iter()
+      .enumerate()
+      .filter(move |(_, &v)| v == owner_id)
+      .map(|(i, _)| MetadataHandle(i as u32))
   }
 
   /// Requests an additional block for a specific MetadataHandle. The allocated block is not
