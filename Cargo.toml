@@ -30,8 +30,7 @@ run-command = [
   # additional drive for block device
   "-drive", "format=raw,if=none,file=disk,id=disk",
   # An extra virt-io device?
-  "-device", "virtio-blk-pci,drive=disk",
-  #"-device", "virtio-blk-device,drive=disk",
+  "-device", "virtio-blk,drive=disk",
   # use UART driver or own window
   #"-nographic",
 ]

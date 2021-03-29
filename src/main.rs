@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-// Extra features
 #![feature(
   asm,
   abi_x86_interrupt,
@@ -13,7 +12,8 @@
   maybe_uninit_extra,
   default_alloc_error_handler,
   const_generics,
-  const_evaluatable_checked
+  const_evaluatable_checked,
+  associated_type_defaults
 )]
 #![allow(unused, incomplete_features)]
 
@@ -30,6 +30,8 @@ use x86_64::{
   VirtAddr,
 };
 
+mod bit_array;
+mod pci;
 mod utils;
 mod vga_buffer;
 mod virtio;
@@ -61,6 +63,7 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   allocator::init_heap();
   vga_buffer::print_at(b"Finished Heap Init", 2, 0);
 
+  /*
   let start = b_info
     .memory_map
     .iter()
@@ -70,6 +73,9 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
     .start_addr();
   let v = unsafe { *((start + 0x0250) as *const u64) };
   write!(vga_buffer::Writer::new(4, 0), "SetupDataType {}", v);
+  */
+  pci::init_block_device_on_pci();
+
   /*
   let dtb = device_tree_paddr;
   struct DtbHeader {
@@ -92,8 +98,9 @@ fn device_tree_init() {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-  vga_buffer::print_at(b"Panicked", 24, 0);
+fn panic(info: &PanicInfo) -> ! {
+  //  vga_buffer::print_at(b"Panicked with {}", 24, 0);
+  write!(vga_buffer::Writer::new(23, 0), "{}", info,);
   loop {}
 }
 

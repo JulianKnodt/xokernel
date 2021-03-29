@@ -1,4 +1,7 @@
-use crate::virtio::{Driver, DRIVER};
+use crate::{
+  bit_array::{nearest_div_8, BitArray},
+  virtio::{Driver, DRIVER},
+};
 use alloc::prelude::v1::Box;
 use core::{any::Any, convert::TryInto};
 
@@ -56,51 +59,13 @@ pub trait Metadata: 'static {
   }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct BitArray<const N: usize>
-where
-  [(); { N / 8 }]: , {
-  items: [u8; { N / 8 }],
-}
-
-impl<const N: usize> BitArray<N>
-where
-  [(); { N / 8 }]: ,
-{
-  const fn new(full: bool) -> Self {
-    let token = if full { 0xff } else { 0 };
-    BitArray {
-      items: [token; { N / 8 }],
-    }
-  }
-  /// Sets bit `i` in this bit array.
-  pub fn set(&mut self, i: usize) { self.items[i / 8] |= (1 << (i % 8)); }
-  /// Unsets bit `i` in this bit array.
-  pub fn unset(&mut self, i: usize) { self.items[i / 8] &= !(1 << (i % 8)); }
-  /// Gets bit `i` in this bit array, where 1 => true, 0 => false.
-  pub fn get(&self, i: usize) -> bool { ((self.items[i / 8] >> (i % 8)) & 1) == 1 }
-  /// Iterates through this bit array trying to find a free block, returning none if there are
-  /// none.
-  pub fn find_free(&self) -> Option<usize> {
-    self
-      .items
-      .iter()
-      .enumerate()
-      .find(|(_, &v)| v != 0xff)
-      .map(|(i, v)| {
-        // TODO is this leading or trailing ones?
-        i * 8 + v.trailing_ones() as usize
-      })
-  }
-}
-
 // Number of Metadata items stored in this block interface.
 const MD_SPACE: usize = 512;
 // Metadata currently has no owner
 const NO_OWNER: u8 = u8::MAX;
 pub struct GlobalBlockInterface<B: BlockDevice>
 where
-  [(); { B::NUM_BLOCKS / 8 }]: , {
+  [(); nearest_div_8(B::NUM_BLOCKS)]: , {
   stored: [Option<Box<dyn Metadata>>; MD_SPACE],
   owners: [u8; MD_SPACE],
 
@@ -114,16 +79,21 @@ where
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct MetadataHandle(u32);
 
-pub static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<Driver> =
+static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<Driver> =
   GlobalBlockInterface::new(unsafe { &mut DRIVER });
+
+pub fn global_block_interface() -> &'static mut GlobalBlockInterface<Driver> {
+  unsafe { &mut GLOBAL_BLOCK_INTERFACE }
+}
 
 fn as_dyn(md: &Box<dyn Metadata>) -> &dyn Any { md }
 
 impl<B: BlockDevice> GlobalBlockInterface<B>
 where
-  [(); { B::NUM_BLOCKS / 8 }]: ,
+  [(); nearest_div_8(B::NUM_BLOCKS)]: ,
 {
   const fn new(block_device: *mut B) -> Self {
+    // TODO load prior if it exists here
     use core::mem::MaybeUninit;
     let mut stored: [MaybeUninit<Option<Box<dyn Metadata>>>; MD_SPACE] =
       MaybeUninit::uninit_array::<MD_SPACE>();
@@ -160,6 +130,14 @@ where
     Ok(MetadataHandle(free_space as u32))
   }
 
+  /// Gets a reference to an instance of Metadata
+  pub fn md_ref<M: Metadata>(&mut self, MetadataHandle(i): MetadataHandle) -> Result<&M, ()> {
+    let md = self.stored.get(i as usize).ok_or(())?;
+    let md = md.as_ref().ok_or(())?;
+    let md = as_dyn(&md).downcast_ref::<M>().ok_or(())?;
+    Ok(md)
+  }
+
   /// Returns the metadata for a given owner_id, used after rebooting the system.
   pub fn metadatas_for(&self, owner_id: u8) -> impl Iterator<Item = MetadataHandle> + '_ {
     self
@@ -172,14 +150,21 @@ where
 
   /// Requests an additional block for a specific MetadataHandle. The allocated block is not
   /// guaranteed to be contiguous.
-  pub fn req_block<M: Metadata>(&mut self, MetadataHandle(i): MetadataHandle) -> Result<(), ()> {
+  pub fn req_block<M: Metadata>(
+    &mut self,
+    MetadataHandle(i): MetadataHandle,
+    new_block: u32,
+  ) -> Result<(), ()> {
+    if self.free_map.get(new_block) {
+      return Err(());
+    }
     let i = i as usize;
     let md = self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
     let mut old_owned = md.owned().iter();
 
-    let new_b = self.free_map.find_free().ok_or(())? as u32;
-    let new_md = as_dyn(&md).downcast_ref::<M>().unwrap().insert(new_b)?;
+    // let new_b = self.free_map.find_free().ok_or(())? as u32;
+    let new_md = as_dyn(&md).downcast_ref::<M>().unwrap().insert(new_block)?;
 
     let mut new_owned = new_md.owned().iter();
     // They must also maintain order between allocations
@@ -191,7 +176,7 @@ where
       return Err(());
     }
     match new_owned.next() {
-      Some(&b) if b == new_b => {},
+      Some(&b) if b == new_block => {},
       // inserted wrong block
       Some(_) => return Err(()),
       // no block seems to have been inserted
@@ -202,8 +187,8 @@ where
       // Some block was removed and not kept in the new metadata
       return Err(());
     }
-    // perform assignments after all checks
-    self.free_map.set(new_b as usize);
+    // perform updates after all checks
+    self.free_map.set(new_block as usize);
     self.stored[i] = Some(Box::new(new_md));
 
     Ok(())
