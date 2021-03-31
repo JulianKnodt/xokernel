@@ -147,11 +147,11 @@ where
     let stored: [Option<_>; MD_SPACE] = unsafe { core::mem::transmute(stored) };
     let mut free_map = BitArray::new(false);
     // This is because of const fns again
-    free_map.set(0);
-    free_map.set(1);
-    free_map.set(2);
-    free_map.set(3);
-    free_map.set(4);
+    let mut i = 0;
+    while i < OWN_BLOCKS {
+      free_map.set(i);
+      i += 1;
+    }
     Self {
       stored,
       owners: [Owner::NoOwner; MD_SPACE],
@@ -288,7 +288,7 @@ where
     MetadataHandle(i): MetadataHandle,
     new_block: u32,
   ) -> Result<(), ()> {
-    if self.free_map.get(new_block) {
+    if self.free_map.get(new_block as usize) {
       return Err(());
     }
     let i = i as usize;

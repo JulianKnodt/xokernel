@@ -1,4 +1,4 @@
-pub const fn nearest_div_8(v: usize) -> usize { v / 8 + if v % 8 == 0 { 0 } else { 1 } }
+pub const fn nearest_div_8(v: usize) -> usize { (v / 8) + if v % 8 == 0 { 0 } else { 1 } }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BitArray<const N: usize>
@@ -20,16 +20,9 @@ where
   /// Sets bit `i` in this bit array.
   pub const fn set(&mut self, i: usize) { self.items[i / 8] |= (1 << (i % 8)); }
   /// Unsets bit `i` in this bit array.
-  pub fn unset(&mut self, i: usize) {
-    assert!(i < N);
-    self.items[i / 8] &= !(1 << (i % 8));
-  }
+  pub const fn unset(&mut self, i: usize) { self.items[i / 8] &= !(1 << (i % 8)); }
   /// Gets bit `i` in this bit array, where 1 => true, 0 => false.
-  pub fn get(&self, i: u32) -> bool {
-    let i = i as usize;
-    assert!(i < N);
-    ((self.items[i / 8] >> (i % 8)) & 1) == 1
-  }
+  pub const fn get(&self, i: usize) -> bool { ((self.items[i / 8] >> (i % 8)) & 1) == 1 }
   /// Iterates through this bit array trying to find a free block, returning none if there are
   /// none.
   pub fn find_free(&self) -> Option<usize> {
@@ -58,6 +51,6 @@ where
   #[inline]
   pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
     // TODO make more efficient?
-    (0..N).map(move |i| self.get(i as u32))
+    (0..N).map(move |i| self.get(i))
   }
 }
