@@ -1,4 +1,7 @@
-use crate::block_interface::{global_block_interface, Metadata, MetadataHandle};
+use crate::{
+  block_interface::{global_block_interface, Metadata, MetadataHandle, Owner},
+  default_ser_impl,
+};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FileDescriptor(u8);
@@ -52,9 +55,10 @@ impl Metadata for Superblock {
       ..*self
     })
   }
+  fn len(&self) -> usize { core::mem::size_of::<Self>() }
+  default_ser_impl!();
 }
 
-pub const LIB_FS_ID: u8 = 0x77;
 pub struct FileSystem {
   superblock: MetadataHandle,
   file_descriptors: [FileDescriptor; 256],
@@ -87,13 +91,15 @@ impl Metadata for INode {
     out.blocks[out.in_use as usize] = 0;
     Ok(out)
   }
+  fn len(&self) -> usize { core::mem::size_of::<Self>() }
+  default_ser_impl!();
 }
 
 impl FileSystem {
   pub fn new(sb_md: Option<MetadataHandle>) -> Self {
     let sb_md = sb_md.unwrap_or_else(|| {
       global_block_interface()
-        .new_metadata::<Superblock>(LIB_FS_ID)
+        .new_metadata::<Superblock>(Owner::LibFS)
         .expect("Failed to allocate superblock metadata")
     });
     let sb = global_block_interface()

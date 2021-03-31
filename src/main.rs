@@ -13,12 +13,14 @@
   default_alloc_error_handler,
   const_generics,
   const_evaluatable_checked,
-  associated_type_defaults
+  associated_type_defaults,
+  pub_macro_rules
 )]
 #![allow(unused, incomplete_features)]
 
 extern crate alloc;
 
+use alloc::prelude::v1::Box;
 use bootloader::bootinfo::{BootInfo, MemoryRegionType};
 use core::{fmt::Write, panic::PanicInfo};
 use x86_64::{
@@ -62,6 +64,8 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   vga_buffer::print_at(b"Finished Init", 1, 0);
   allocator::init_heap();
   vga_buffer::print_at(b"Finished Heap Init", 2, 0);
+
+  let b = Box::new(32u32);
 
   /*
   let start = b_info

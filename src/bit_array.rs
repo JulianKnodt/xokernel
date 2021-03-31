@@ -4,7 +4,7 @@ pub const fn nearest_div_8(v: usize) -> usize { v / 8 + if v % 8 == 0 { 0 } else
 pub struct BitArray<const N: usize>
 where
   [(); nearest_div_8(N)]: , {
-  items: [u8; nearest_div_8(N)],
+  pub(crate) items: [u8; nearest_div_8(N)],
 }
 
 impl<const N: usize> BitArray<N>
@@ -18,10 +18,7 @@ where
     }
   }
   /// Sets bit `i` in this bit array.
-  pub fn set(&mut self, i: usize) {
-    assert!(i < N);
-    self.items[i / 8] |= (1 << (i % 8));
-  }
+  pub const fn set(&mut self, i: usize) { self.items[i / 8] |= (1 << (i % 8)); }
   /// Unsets bit `i` in this bit array.
   pub fn unset(&mut self, i: usize) {
     assert!(i < N);
@@ -56,5 +53,11 @@ where
         }
         Some(8 * (N - 1) + last.trailing_ones() as usize)
       })
+  }
+
+  #[inline]
+  pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+    // TODO make more efficient?
+    (0..N).map(move |i| self.get(i as u32))
   }
 }
