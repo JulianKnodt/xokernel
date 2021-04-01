@@ -40,8 +40,8 @@ mod virtio;
 
 mod fs;
 
-// mod uart;
 mod block_interface;
+use block_interface::Metadata;
 
 mod allocator;
 
@@ -65,8 +65,6 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   allocator::init_heap();
   vga_buffer::print_at(b"Finished Heap Init", 2, 0);
 
-  let b = Box::new(32u32);
-
   /*
   let start = b_info
     .memory_map
@@ -81,24 +79,25 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   pci::init_block_device_on_pci();
 
   /*
-  let dtb = device_tree_paddr;
-  struct DtbHeader {
-      be_magic: u32,
-      be_size: u32,
+  let init = block_interface::global_block_interface().try_init(|bytes| {
+    fs::Superblock::de(bytes).and_then(|(v, used)| {
+      if used == bytes.len() {
+        let v: Box<dyn Metadata> = Box::new(v);
+        Ok(v)
+      } else {
+        Err(())
+      }
+    })
+  });
+  if init.is_err() {
+    write!(
+      vga_buffer::Writer::new(8, 0),
+      "Failed to init block interface",
+    );
   }
-  let header = unsafe { &*(arg0 as *const DtbHeader) };
-  write!(
-    vga_buffer::Writer::new(5, 0),
-    "{:x}",
-    u32::from_be(header.be_magic),
-  );
   */
 
   loop {}
-}
-
-fn device_tree_init() {
-  const DEVICE_TREE_MAGIC: u32 = 0xd00dfeed;
 }
 
 #[panic_handler]

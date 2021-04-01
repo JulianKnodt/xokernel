@@ -1,9 +1,12 @@
-use crate::{
-  bit_array::{nearest_div_8, BitArray},
-  virtio::Driver,
-};
+use crate::bit_array::{nearest_div_8, BitArray};
+#[cfg(target_os = "macos")]
+use crate::linux_files::Driver;
+#[cfg(not(target_os = "macos"))]
+use crate::virtio::Driver;
+
+#[cfg(not(target_os = "macos"))]
 use alloc::prelude::v1::Box;
-use core::{any::Any, convert::TryInto};
+use core::any::Any;
 
 pub trait BlockDevice {
   const NUM_BLOCKS: usize;
@@ -74,6 +77,9 @@ pub trait Metadata: 'static {
 
 const OWN_BLOCKS: usize = 5;
 
+/// What is the first block that can be used by LibFS's
+pub const FIRST_FREE_BLOCK: u32 = 5;
+
 // Number of Metadata items stored in this block interface.
 const MD_SPACE: usize = 32;
 
@@ -120,7 +126,7 @@ where
 pub struct MetadataHandle(u32);
 
 static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<Driver> =
-  GlobalBlockInterface::new(unsafe { Driver::new() });
+  GlobalBlockInterface::new(Driver::new());
 
 pub fn global_block_interface() -> &'static mut GlobalBlockInterface<Driver> {
   unsafe { &mut GLOBAL_BLOCK_INTERFACE }
@@ -340,7 +346,7 @@ where
     let owned = md.owned();
     let &b_n = owned.get(n).ok_or(())?;
 
-    unsafe { self.block_device.read(b_n, dst) }
+    self.block_device.read(b_n, dst)
   }
 
   /// Writes to the `n`th block of the metadata handle from src
@@ -356,8 +362,9 @@ where
     let owned = md.owned();
     let &b_n = owned.get(n).ok_or(())?;
 
-    unsafe { self.block_device.write(b_n, src) }
+    self.block_device.write(b_n, src)
   }
+  #[allow(dead_code)]
   fn own_required_blocks(&self) -> usize {
     let num_bytes = core::mem::size_of::<u32>()
       + MD_SPACE
@@ -374,7 +381,8 @@ where
   pub fn persist_block_interface(&mut self)
   where
     [(); B::BLOCK_SIZE]: , {
-    let num_blocks_required = self.own_required_blocks();
-    let mut buf = [0; B::BLOCK_SIZE];
+    // let num_blocks_required = self.own_required_blocks();
+    //let mut buf = [0; B::BLOCK_SIZE];
+    todo!()
   }
 }

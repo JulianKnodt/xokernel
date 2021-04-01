@@ -1,21 +1,54 @@
 use crate::{
-  block_interface::{global_block_interface, Metadata, MetadataHandle, Owner},
+  block_interface::{global_block_interface, Metadata, MetadataHandle, Owner, FIRST_FREE_BLOCK},
   default_ser_impl,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct FileDescriptor(u8);
+pub struct FileDescriptor(u32);
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum FileMode {
+  R,
+  W,
+  RW,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct FileDescEntry {
+  inode: u32,
+  offset: u32,
+  open_refs: u16,
+  mode: FileMode,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct Directory {
+  parent_inode: u32,
+  num_entries: u32,
+  // don't need to read through all of the entries here
+  inode_to_names: [([u8; 16], u16); 128],
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct INode {
-  blocks: [u32; 8],
-  in_use: u8,
+  refs: u16,
+  kind: INodeKind,
+  file_size: u32,
+  data_blocks: [u16; 8],
+}
+
+#[repr(u16)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum INodeKind {
+  File = 0,
+  Directory = 1,
 }
 
 const MAGIC_NUMBER: u32 = 0x101_0_F_0ff;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Superblock {
+pub(crate) struct Superblock {
   magic_number: u32,
   num_inodes: u32,
   num_data: u32,
@@ -61,38 +94,9 @@ impl Metadata for Superblock {
 
 pub struct FileSystem {
   superblock: MetadataHandle,
-  file_descriptors: [FileDescriptor; 256],
+  open_files: [FileDescEntry; 256],
   metadatas: [Option<MetadataHandle>; 256],
-}
-
-impl Metadata for INode {
-  fn new() -> Self {
-    INode {
-      blocks: [0; 8],
-      in_use: 0,
-    }
-  }
-  fn owned(&self) -> &[u32] { &self.blocks[..self.in_use as usize] }
-  fn insert(&self, b: u32) -> Result<Self, ()> {
-    if (self.in_use as usize) == self.blocks.len() {
-      return Err(());
-    }
-    let mut out = self.clone();
-    out.blocks[out.in_use as usize] = b;
-    out.in_use += 1;
-    Ok(out)
-  }
-  fn remove(&self, b: u32) -> Result<Self, ()> {
-    if self.in_use == 0 {
-      return Err(());
-    }
-    let mut out = self.clone();
-    out.in_use -= 1;
-    out.blocks[out.in_use as usize] = 0;
-    Ok(out)
-  }
-  fn len(&self) -> usize { core::mem::size_of::<Self>() }
-  default_ser_impl!();
+  root: u32,
 }
 
 impl FileSystem {
@@ -107,13 +111,28 @@ impl FileSystem {
       .unwrap();
     if sb.owned().is_empty() {
       global_block_interface()
-        .req_block::<Superblock>(sb_md, 0)
+        .req_block::<Superblock>(sb_md, FIRST_FREE_BLOCK)
         .expect("Failed to allocate block for superblock");
     }
 
     // TODO read from superblock
     todo!()
   }
-  pub fn open(&self) -> Result<FileDescriptor, ()> { todo!() }
-  pub fn close(&self, fd: FileDescriptor) -> Result<(), ()> { todo!() }
+  /// Opens a given path (always absolute)
+  pub fn open(&self, path: &[&str], mode: FileMode) -> Result<FileDescriptor, ()> {
+    let mut curr_inode: u32 = self.root;
+    for segment in path {}
+    todo!()
+  }
+  pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
+    let i = i as usize;
+    let open_file = &mut self.open_files[i];
+    if open_file.open_refs == 0 {
+      return Err(());
+    }
+    open_file.open_refs -= 1;
+    // If inode is no longer referenced here, need to delete it
+    todo!();
+    return Ok(());
+  }
 }
