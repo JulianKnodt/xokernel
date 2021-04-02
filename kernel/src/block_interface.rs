@@ -263,9 +263,8 @@ where
   }
 
   /// Tries to initialize this
-  pub fn try_init<F>(&mut self, create_metadata: F) -> Result<(), ()>
+  pub fn try_init(&mut self) -> Result<(), ()>
   where
-    F: Fn(&[u8]) -> Result<AllMetadata, ()>,
     [(); OWN_BLOCKS * B::BLOCK_SIZE]: , {
     self.block_device.init();
 
@@ -298,7 +297,10 @@ where
       let len =
         u32::from_ne_bytes([buf[curr], buf[curr + 1], buf[curr + 2], buf[curr + 3]]) as usize;
       curr += 4;
-      self.stored[i] = Some(create_metadata(&buf[curr..curr + len])?);
+      let id = MetadataID::from(buf[curr]);
+      curr += 1;
+      let len = id.len();
+      self.stored[i] = Some(AllMetadata::de(id, &buf[curr..curr +len])?);
       curr += len;
     }
     Ok(())

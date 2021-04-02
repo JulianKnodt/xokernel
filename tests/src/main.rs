@@ -34,31 +34,8 @@ pub fn global_block_interface() -> &'static mut GlobalBlockInterface<linux_files
 }
 
 fn main() {
-  /*
-  let gbi = global_block_interface();
-  gbi
-    .try_init(|bytes| {
-      fs::Superblock::de(bytes).and_then(|(sb, used)| {
-        if used == bytes.len() {
-          let b: Box<dyn Metadata> = Box::new(sb);
-          Ok(b)
-        } else {
-          Err(())
-        }
-      })
-    })
-    .expect("Failed to init block interface");
-  let sb = gbi.metadatas_for(Owner::LibFS).find(|&mdh|
-    gbi.md_ref::<fs::Superblock>(mdh).is_ok()
-  );
-  */
-  /*
-  let sb = gbi
-    .metadatas_of::<fs::Superblock>(Owner::LibFS)
-    .next()
-    .map(|v| v.1);
-  let fs_impl = fs::FileSystem::new(sb);
-  */
+  global_block_interface().try_init().expect("Failed to init global block interface");
+  let fs = fs::FileSystem::new(global_block_interface());
 }
 
 #[test]
