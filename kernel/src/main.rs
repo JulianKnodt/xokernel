@@ -14,6 +14,7 @@
   const_generics,
   const_evaluatable_checked,
   associated_type_defaults,
+  generic_associated_types,
   pub_macro_rules
 )]
 #![allow(unused, incomplete_features)]
@@ -41,9 +42,17 @@ mod virtio;
 mod fs;
 
 mod block_interface;
-use block_interface::Metadata;
+use block_interface::{GlobalBlockInterface, Metadata};
 
 mod allocator;
+
+static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<virtio::Driver> =
+  GlobalBlockInterface::new(virtio::Driver::new());
+
+// TODO maybe move this into main because it doesn't need to be defined in this file.
+pub fn global_block_interface() -> &'static mut GlobalBlockInterface<virtio::Driver> {
+  unsafe { &mut GLOBAL_BLOCK_INTERFACE }
+}
 
 const SETUP_DATA: *const SetupData = 0250u64 as *const SetupData;
 

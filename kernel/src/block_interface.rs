@@ -1,11 +1,10 @@
 use crate::bit_array::{nearest_div_8, BitArray};
-#[cfg(target_os = "macos")]
-use crate::linux_files::Driver;
-#[cfg(not(target_os = "macos"))]
-use crate::virtio::Driver;
 
+/*
 #[cfg(not(target_os = "macos"))]
 use alloc::prelude::v1::Box;
+*/
+
 use core::any::Any;
 
 pub trait BlockDevice {
@@ -41,7 +40,11 @@ pub trait Metadata: 'static {
   fn new() -> Self
   where
     Self: Sized;
-  fn owned(&self) -> &[u32];
+
+  type Iter<'a>: IntoIterator<Item = u32> + 'a;
+  fn owned(&self) -> Self::Iter<'_>;
+
+  const LEN: usize;
 
   // TODO possibly add associated error types here
 
@@ -52,8 +55,6 @@ pub trait Metadata: 'static {
   // code which allows for raw-ptr manipulation
   // also need to have a functional interface here, to allow for rollback if there are errors.
 
-  fn len(&self) -> usize;
-
   fn insert(&self, b: u32) -> Result<Self, ()>
   where
     Self: Sized;
@@ -62,7 +63,9 @@ pub trait Metadata: 'static {
   where
     Self: Sized;
   /// Serializes this instance into a byte array
-  fn ser(&self) -> &[u8];
+  fn ser(&self) -> &[u8]
+  where
+    Self: Sized;
   /// returns the number of bytes read and an instance of Self
   fn de(bytes: &[u8]) -> Result<(Self, usize), ()>
   where
@@ -74,6 +77,109 @@ pub trait Metadata: 'static {
     Ok((v, len))
   }
 }
+
+/// Macro for creating an enum over all possible Metadata, instead of using the dyn approach.
+/// This assumption that we know all the metadata may be harder to achieve in practice, but
+/// would also give more performance guarantees.
+#[macro_export]
+macro_rules! mk_metadata_enum {
+  ( $( ($md_id: ident, $md: ty)$(,)? )+ ) => {
+    /// A specific ID for each metadata registered with the system
+    /// This allows for easily deserializing items
+    #[repr(u8)]
+    #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+    pub enum MetadataID {
+      $( $md_id, )+
+      Unknown
+    }
+
+    impl From<u8> for MetadataID {
+      fn from(v: u8) -> Self {
+        $(
+          if v == Self::$md_id as u8 {
+            return Self::$md_id
+          }
+        )+
+        return MetadataID::Unknown
+      }
+    }
+    impl MetadataID {
+      pub fn len(self) -> usize {
+        match self {
+          $(Self::$md_id => core::mem::size_of::<$md>(), )+
+          Self::Unknown => 0,
+        }
+      }
+    }
+    #[derive(Clone, Debug)]
+    pub enum AllMetadata {
+      $( $md_id($md), )+
+    }
+    pub enum MetadataIter<'a> {
+      $( $md_id(<<$md as Metadata>::Iter<'a> as IntoIterator>::IntoIter), )+
+    }
+
+    impl<'a> Iterator for MetadataIter<'a> {
+      type Item = u32;
+      fn next(&mut self) -> Option<Self::Item> {
+        match self {
+          $( Self::$md_id(v) => v.next(), )+
+        }
+      }
+    }
+    $(
+      impl From<$md> for AllMetadata {
+        fn from(v: $md) -> Self {
+          Self::$md_id(v)
+        }
+      }
+    )+
+    impl AllMetadata {
+      #[inline]
+      pub fn id(&self) -> MetadataID {
+        match self {
+          $( Self::$md_id(_) => MetadataID::$md_id, )+
+        }
+      }
+      pub fn owned(&self) -> MetadataIter {
+        match self {
+          $( Self::$md_id(v) => MetadataIter::$md_id(v.owned().into_iter()),  )+
+        }
+      }
+      pub fn insert(&self, b: u32) -> Result<Self, ()> {
+        match self {
+          $( Self::$md_id(v) => Ok(Self::$md_id(v.insert(b)?)),  )+
+        }
+      }
+      pub fn len(&self) -> usize {
+        match self {
+          $( Self::$md_id(_) => <$md as Metadata>::LEN,  )+
+        }
+      }
+      pub fn ser(&self) -> &[u8] {
+        match self {
+          $( Self::$md_id(v) => v.ser(),  )+
+        }
+      }
+      /// Deserializes some bytes into Self
+      pub fn de(id: MetadataID, bytes: &[u8]) -> Result<Self, ()> {
+        match id {
+          $( MetadataID::$md_id => {
+            let (v, read) = <$md>::de(bytes)?;
+            assert_eq!(read, bytes.len());
+            Ok(v.into())
+          }  )+
+          MetadataID::Unknown => Err(()),
+        }
+      }
+    }
+  }
+}
+
+mk_metadata_enum!(
+  (Superblock, crate::fs::Superblock),
+  (RangeMetadata, crate::fs::RangeMetadata),
+);
 
 const OWN_BLOCKS: usize = 5;
 
@@ -105,34 +211,24 @@ impl Owner {
   }
 }
 
+/// The struct for a singleton which interfaces with the device on behalf of LibFSs.
+#[derive(Debug)]
 pub struct GlobalBlockInterface<B: BlockDevice>
 where
   [(); nearest_div_8(B::NUM_BLOCKS)]: , {
-  // TODO maybe condense these fields?
-  stored: [Option<Box<dyn Metadata>>; MD_SPACE],
+  stored: [Option<AllMetadata>; MD_SPACE],
   owners: [Owner; MD_SPACE],
 
-  // There should be a free_map per block-device, but its representation might be generalizable.
-  // For now just go with a bit array.
+  // There should be a free_map per block-device,
+  // but its representation might be generalizable. For now just go with a bit array.
   free_map: BitArray<{ B::NUM_BLOCKS }>,
 
-  // TODO decide whether or not to include a BlockDescriptor sort of thing with an offset?
-  // I don't think it's wise to include this, because blocks can't be partially written, it's
-  // just all at once.
   block_device: B,
 }
 
+/// A capability for metadata.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct MetadataHandle(u32);
-
-static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<Driver> =
-  GlobalBlockInterface::new(Driver::new());
-
-pub fn global_block_interface() -> &'static mut GlobalBlockInterface<Driver> {
-  unsafe { &mut GLOBAL_BLOCK_INTERFACE }
-}
-
-fn as_dyn(md: &Box<dyn Metadata>) -> &dyn Any { md }
 
 impl<B: BlockDevice> GlobalBlockInterface<B>
 where
@@ -140,9 +236,9 @@ where
   [(); B::BLOCK_SIZE]: ,
 {
   /// Creates an empty instance of a the global block interface
-  const fn new(block_device: B) -> Self {
+  pub const fn new(block_device: B) -> Self {
     use core::mem::MaybeUninit;
-    let mut stored: [MaybeUninit<Option<Box<dyn Metadata>>>; MD_SPACE] =
+    let mut stored: [MaybeUninit<Option<AllMetadata>>; MD_SPACE] =
       MaybeUninit::uninit_array::<MD_SPACE>();
     let mut i = 0;
     // necessary to use a while loop here because of constraints on const fns.
@@ -169,7 +265,7 @@ where
   /// Tries to initialize this
   pub fn try_init<F>(&mut self, create_metadata: F) -> Result<(), ()>
   where
-    F: Fn(&[u8]) -> Result<Box<dyn Metadata>, ()>,
+    F: Fn(&[u8]) -> Result<AllMetadata, ()>,
     [(); OWN_BLOCKS * B::BLOCK_SIZE]: , {
     self.block_device.init();
 
@@ -251,11 +347,14 @@ where
   pub fn free_map(&self) -> &BitArray<{ B::NUM_BLOCKS }> { &self.free_map }
 
   /// Allocates new metadata inside of the system
-  pub fn new_metadata<M: Metadata>(&mut self, owner: Owner) -> Result<MetadataHandle, ()> {
+  pub fn new_metadata<M: Metadata + Into<AllMetadata>>(
+    &mut self,
+    owner: Owner,
+  ) -> Result<MetadataHandle, ()> {
     assert_ne!(owner, Owner::NoOwner);
     let md = M::new();
     let starting_owned = md.owned();
-    if !starting_owned.is_empty() {
+    if starting_owned.into_iter().next().is_some() {
       // We expect metadata to start off empty
       return Err(());
     }
@@ -264,48 +363,50 @@ where
       None => return Err(()),
       Some(space) => space,
     };
-    self.stored[free_space] = Some(Box::new(md));
+    self.stored[free_space] = Some(md.into());
     self.owners[free_space] = owner;
     Ok(MetadataHandle(free_space as u32))
   }
 
   /// Gets a reference to an instance of Metadata
-  pub fn md_ref<M: Metadata>(&mut self, MetadataHandle(i): MetadataHandle) -> Result<&M, ()> {
+  pub fn md_ref(&mut self, MetadataHandle(i): MetadataHandle) -> Result<&AllMetadata, ()> {
     let md = self.stored.get(i as usize).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
-    let md = as_dyn(&md).downcast_ref::<M>().ok_or(())?;
     Ok(md)
   }
 
   /// Returns the metadata for a given owner_id, used after rebooting the system.
-  pub fn metadatas_for(&self, owner: Owner) -> impl Iterator<Item = MetadataHandle> + '_ {
+  pub fn metadatas_for(
+    &self,
+    owner: Owner,
+  ) -> impl Iterator<Item = (MetadataHandle, &'_ AllMetadata)> + '_ {
     self
       .owners
       .iter()
       .enumerate()
       .filter(move |(_, &v)| v == owner)
-      .map(|(i, _)| MetadataHandle(i as u32))
+      .filter_map(move |(i, _)| {
+        self.stored[i]
+          .as_ref()
+          .map(|amd| (MetadataHandle(i as u32), amd))
+      })
   }
 
   /// Requests an additional block for a specific MetadataHandle. The allocated block is not
   /// guaranteed to be contiguous.
-  pub fn req_block<M: Metadata>(
-    &mut self,
-    MetadataHandle(i): MetadataHandle,
-    new_block: u32,
-  ) -> Result<(), ()> {
+  pub fn req_block(&mut self, MetadataHandle(i): MetadataHandle, new_block: u32) -> Result<(), ()> {
     if self.free_map.get(new_block as usize) {
       return Err(());
     }
     let i = i as usize;
     let md = self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
-    let mut old_owned = md.owned().iter();
+    let mut old_owned = md.owned();
 
     // let new_b = self.free_map.find_free().ok_or(())? as u32;
-    let new_md = as_dyn(&md).downcast_ref::<M>().unwrap().insert(new_block)?;
+    let new_md = md.insert(new_block)?;
 
-    let mut new_owned = new_md.owned().iter();
+    let mut new_owned = new_md.owned();
     // They must also maintain order between allocations
     if !new_owned
       .by_ref()
@@ -315,7 +416,7 @@ where
       return Err(());
     }
     match new_owned.next() {
-      Some(&b) if b == new_block => {},
+      Some(b) if b == new_block => {},
       // inserted wrong block
       Some(_) => return Err(()),
       // no block seems to have been inserted
@@ -328,7 +429,7 @@ where
     }
     // perform updates after all checks
     self.free_map.set(new_block as usize);
-    self.stored[i] = Some(Box::new(new_md));
+    self.stored[i] = Some(new_md);
 
     Ok(())
   }
@@ -343,8 +444,7 @@ where
     let i = i as usize;
     let md = self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
-    let owned = md.owned();
-    let &b_n = owned.get(n).ok_or(())?;
+    let b_n = md.owned().nth(n).ok_or(())?;
 
     self.block_device.read(b_n, dst)
   }
@@ -357,10 +457,9 @@ where
     src: &[u8],
   ) -> Result<usize, ()> {
     let i = i as usize;
-    let md = self.stored.get(i).ok_or(())?;
+    let md = &self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
-    let owned = md.owned();
-    let &b_n = owned.get(n).ok_or(())?;
+    let b_n = md.owned().nth(n).ok_or(())?;
 
     self.block_device.write(b_n, src)
   }
@@ -372,7 +471,7 @@ where
       + self
         .stored
         .iter()
-        .filter_map(|v| v.as_ref().map(|v| v.len()))
+        .filter_map(|v| Some(v.as_ref()?.len()))
         .sum::<usize>();
     num_bytes / B::BLOCK_SIZE
   }
