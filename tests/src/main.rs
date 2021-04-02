@@ -34,7 +34,9 @@ pub fn global_block_interface() -> &'static mut GlobalBlockInterface<linux_files
 }
 
 fn main() {
-  global_block_interface().try_init().expect("Failed to init global block interface");
+  global_block_interface()
+    .try_init()
+    .expect("Failed to init global block interface");
   let fs = fs::FileSystem::new(global_block_interface());
 }
 

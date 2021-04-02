@@ -85,21 +85,21 @@ pub trait Metadata: 'static {
 macro_rules! mk_metadata_enum {
   ( $( ($md_id: ident, $md: ty)$(,)? )+ ) => {
     /// A specific ID for each metadata registered with the system
-    /// This allows for easily deserializing items
+    /// This allows for easily ser/deserializing items.
     #[repr(u8)]
     #[derive(PartialEq, Eq, Clone, Copy, Debug)]
     pub enum MetadataID {
       $( $md_id, )+
+      /// An unknown metadata ID, this hopefully should never be reached.
+      /// Probably indicates an error state.
       Unknown
     }
 
     impl From<u8> for MetadataID {
       fn from(v: u8) -> Self {
-        $(
-          if v == Self::$md_id as u8 {
+        $(if v == Self::$md_id as u8 {
             return Self::$md_id
-          }
-        )+
+        })+
         return MetadataID::Unknown
       }
     }
@@ -115,6 +115,7 @@ macro_rules! mk_metadata_enum {
     pub enum AllMetadata {
       $( $md_id($md), )+
     }
+    #[derive(Clone, Debug)]
     pub enum MetadataIter<'a> {
       $( $md_id(<<$md as Metadata>::Iter<'a> as IntoIterator>::IntoIter), )+
     }
@@ -127,13 +128,9 @@ macro_rules! mk_metadata_enum {
         }
       }
     }
-    $(
-      impl From<$md> for AllMetadata {
-        fn from(v: $md) -> Self {
-          Self::$md_id(v)
-        }
-      }
-    )+
+    $(impl From<$md> for AllMetadata {
+      fn from(v: $md) -> Self { Self::$md_id(v) }
+    })+
     impl AllMetadata {
       #[inline]
       pub fn id(&self) -> MetadataID {
@@ -148,12 +145,12 @@ macro_rules! mk_metadata_enum {
       }
       pub fn insert(&self, b: u32) -> Result<Self, ()> {
         match self {
-          $( Self::$md_id(v) => Ok(Self::$md_id(v.insert(b)?)),  )+
+          $( Self::$md_id(v) => Ok(Self::$md_id(v.insert(b)?)), )+
         }
       }
       pub fn len(&self) -> usize {
         match self {
-          $( Self::$md_id(_) => <$md as Metadata>::LEN,  )+
+          $( Self::$md_id(_) => <$md as Metadata>::LEN, )+
         }
       }
       pub fn ser(&self) -> &[u8] {
@@ -164,11 +161,11 @@ macro_rules! mk_metadata_enum {
       /// Deserializes some bytes into Self
       pub fn de(id: MetadataID, bytes: &[u8]) -> Result<Self, ()> {
         match id {
-          $( MetadataID::$md_id => {
+          $(MetadataID::$md_id => {
             let (v, read) = <$md>::de(bytes)?;
             assert_eq!(read, bytes.len());
             Ok(v.into())
-          }  )+
+          })+
           MetadataID::Unknown => Err(()),
         }
       }
@@ -300,7 +297,7 @@ where
       let id = MetadataID::from(buf[curr]);
       curr += 1;
       let len = id.len();
-      self.stored[i] = Some(AllMetadata::de(id, &buf[curr..curr +len])?);
+      self.stored[i] = Some(AllMetadata::de(id, &buf[curr..curr + len])?);
       curr += len;
     }
     Ok(())
@@ -327,10 +324,11 @@ where
       if owner == Owner::NoOwner {
         continue;
       }
-      let md = self.stored[i]
-        .as_ref()
-        .expect("No metadata but owner")
-        .ser();
+      let md = self.stored[i].as_ref().expect("No metadata but owner exists");
+      let id = md.id();
+      buf[curr] = id as u8;
+      curr += 1;
+      let md = md.ser();
       let len = md.len();
       buf[curr..curr + 4].copy_from_slice(&u32::to_ne_bytes(len as u32));
       curr += 4;
