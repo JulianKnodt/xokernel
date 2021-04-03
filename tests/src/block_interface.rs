@@ -138,6 +138,7 @@ macro_rules! mk_metadata_enum {
           $( Self::$md_id(_) => MetadataID::$md_id, )+
         }
       }
+      #[inline]
       pub fn owned(&self) -> MetadataIter {
         match self {
           $( Self::$md_id(v) => MetadataIter::$md_id(v.owned().into_iter()),  )+
@@ -178,14 +179,16 @@ mk_metadata_enum!(
   (RangeMetadata, crate::fs::RangeMetadata),
 );
 
-const OWN_BLOCKS: usize = 5;
+/// Number of blocks kernel owns to maintain its own state.
+pub const OWN_BLOCKS: usize = 5;
 
 /// What is the first block that can be used by LibFS's
 pub const FIRST_FREE_BLOCK: u32 = 5;
 
-// Number of Metadata items stored in this block interface.
-const MD_SPACE: usize = 32;
+/// Number of Metadata items stored in this block interface.
+pub const MD_SPACE: usize = 32;
 
+/// Magic number for kernel to be sure that it has initialized.
 const MAGIC_NUMBER: u32 = 0xdea1d00d;
 
 #[repr(u8)]
@@ -203,7 +206,7 @@ impl Owner {
       0 => Self::Ours,
       1 => Self::LibFS,
       255 => Self::NoOwner,
-      _ => panic!("Unknown owner byte"),
+      v => panic!("Unknown owner byte {:?}", b),
     }
   }
 }
@@ -213,6 +216,7 @@ impl Owner {
 pub struct GlobalBlockInterface<B: BlockDevice>
 where
   [(); nearest_div_8(B::NUM_BLOCKS)]: , {
+  // TODO convert this to one field with below.
   stored: [Option<AllMetadata>; MD_SPACE],
   owners: [Owner; MD_SPACE],
 
@@ -227,10 +231,32 @@ where
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct MetadataHandle(u32);
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ReqBlockErr {
+  BlockNotFree,
+  MetadataNotInRange,
+  NoSuchMetadata,
+  InvariantFailed,
+  Internal,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PersistErr {
+  FailedToWrite,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum InitErr {
+  FailedToRead,
+  FailedToInitMetadata,
+  Persist(PersistErr),
+}
+
 impl<B: BlockDevice> GlobalBlockInterface<B>
 where
   [(); nearest_div_8(B::NUM_BLOCKS)]: ,
   [(); B::BLOCK_SIZE]: ,
+  [(); OWN_BLOCKS * B::BLOCK_SIZE]: ,
 {
   /// Creates an empty instance of a the global block interface
   pub const fn new(block_device: B) -> Self {
@@ -260,22 +286,19 @@ where
   }
 
   /// Tries to initialize this
-  pub fn try_init(&mut self) -> Result<(), ()>
-  where
-    [(); OWN_BLOCKS * B::BLOCK_SIZE]: , {
+  pub fn try_init(&mut self) -> Result<(), InitErr> {
     self.block_device.init();
 
     let mut buf = [0; OWN_BLOCKS * B::BLOCK_SIZE];
     for i in 0..OWN_BLOCKS {
       let read = self
         .block_device
-        .read(i as u32, &mut buf[i * B::BLOCK_SIZE..])?;
+        .read(i as u32, &mut buf[i * B::BLOCK_SIZE..])
+        .map_err(|_| InitErr::FailedToRead)?;
       assert_eq!(read, B::BLOCK_SIZE);
     }
-    // --- read magic number
     if u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) != MAGIC_NUMBER {
-      // Never previously serialized this item, nothing more to do
-      return self.persist();
+      return self.persist().map_err(|p| InitErr::Persist(p));
     }
     // --- read free map
     let mut curr = 4;
@@ -291,25 +314,27 @@ where
       if owner == Owner::NoOwner {
         continue;
       }
-      let len =
-        u32::from_ne_bytes([buf[curr], buf[curr + 1], buf[curr + 2], buf[curr + 3]]) as usize;
-      curr += 4;
       let id = MetadataID::from(buf[curr]);
+      assert_ne!(
+        id,
+        MetadataID::Unknown,
+        "Encountered Unknown ID but found Owner({:?})",
+        owner
+      );
       curr += 1;
       let len = id.len();
-      self.stored[i] = Some(AllMetadata::de(id, &buf[curr..curr + len])?);
+      self.stored[i] = Some(
+        AllMetadata::de(id, &buf[curr..curr + len]).map_err(|_| InitErr::FailedToInitMetadata)?,
+      );
       curr += len;
     }
     Ok(())
   }
 
-  pub fn persist(&self) -> Result<(), ()>
-  where
-    [(); OWN_BLOCKS * B::BLOCK_SIZE]: , {
+  pub fn persist(&self) -> Result<(), PersistErr> {
     let mut buf = [0; OWN_BLOCKS * B::BLOCK_SIZE];
     // --- write magic number
-    let bytes = u32::to_ne_bytes(MAGIC_NUMBER);
-    buf[..4].copy_from_slice(&bytes);
+    buf[..4].copy_from_slice(&u32::to_ne_bytes(MAGIC_NUMBER));
     // --- write free map
     let mut curr = 4;
     let len = self.free_map.items.len();
@@ -324,21 +349,31 @@ where
       if owner == Owner::NoOwner {
         continue;
       }
-      let md = self.stored[i].as_ref().expect("No metadata but owner exists");
+      let md = self.stored[i]
+        .as_ref()
+        .expect("No metadata but owner exists");
       let id = md.id();
       buf[curr] = id as u8;
       curr += 1;
       let md = md.ser();
-      let len = md.len();
-      buf[curr..curr + 4].copy_from_slice(&u32::to_ne_bytes(len as u32));
-      curr += 4;
+      let len = id.len();
+      assert_eq!(
+        md.len(),
+        id.len(),
+        "`ser` invariant broken, incorrect length"
+      );
       buf[curr..curr + len].copy_from_slice(md);
       curr += len;
     }
+    assert!(curr <= buf.len(), "Wrote past end of buffer without panic?");
     for i in 0..OWN_BLOCKS {
       let written = self
         .block_device
-        .write(i as u32, &mut buf[i * B::BLOCK_SIZE..])?;
+        .write(
+          i as u32,
+          &mut buf[i * B::BLOCK_SIZE..(i + 1) * B::BLOCK_SIZE],
+        )
+        .map_err(|_| PersistErr::FailedToWrite)?;
       assert_eq!(written, B::BLOCK_SIZE);
     }
     Ok(())
@@ -368,11 +403,27 @@ where
     Ok(MetadataHandle(free_space as u32))
   }
 
-  /// Gets a reference to an instance of Metadata
+  /// Gets a reference to an instance of Metadata, which is safe since this only returns a
+  /// reference,
   pub fn md_ref(&mut self, MetadataHandle(i): MetadataHandle) -> Result<&AllMetadata, ()> {
     let md = self.stored.get(i as usize).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
     Ok(md)
+  }
+
+  /// In the case that a LibFS wants to modify a Metadata,
+  pub fn modify_ref<F>(&mut self, MetadataHandle(i): MetadataHandle, mut f: F) -> Result<(), ()>
+  where
+    F: FnMut(&AllMetadata) -> Result<AllMetadata, ()>, {
+    let i = i as usize;
+    let md = self.stored.get(i).ok_or(())?;
+    let md = md.as_ref().ok_or(())?;
+    let new = f(md)?;
+    if !new.owned().eq(md.owned()) {
+      return Err(());
+    }
+    self.stored[i] = Some(new);
+    Ok(())
   }
 
   /// Returns the metadata for a given owner_id, used after rebooting the system.
@@ -394,38 +445,42 @@ where
 
   /// Requests an additional block for a specific MetadataHandle. The allocated block is not
   /// guaranteed to be contiguous.
-  pub fn req_block(&mut self, MetadataHandle(i): MetadataHandle, new_block: u32) -> Result<(), ()> {
+  pub fn req_block(
+    &mut self,
+    MetadataHandle(i): MetadataHandle,
+    new_block: u32,
+  ) -> Result<(), ReqBlockErr> {
     if self.free_map.get(new_block as usize) {
-      return Err(());
+      return Err(ReqBlockErr::BlockNotFree);
     }
     let i = i as usize;
-    let md = self.stored.get(i).ok_or(())?;
-    let md = md.as_ref().ok_or(())?;
+    let md = self.stored.get(i).ok_or(ReqBlockErr::MetadataNotInRange)?;
+    let md = md.as_ref().ok_or(ReqBlockErr::NoSuchMetadata)?;
     let mut old_owned = md.owned();
 
-    // let new_b = self.free_map.find_free().ok_or(())? as u32;
-    let new_md = md.insert(new_block)?;
+    // println!("{:?} {}", md, new_block);
+    let new_md = md.insert(new_block).map_err(|_| ReqBlockErr::Internal)?;
 
     let mut new_owned = new_md.owned();
     // They must also maintain order between allocations
-    if !new_owned
+    if !old_owned
       .by_ref()
-      .zip(old_owned.by_ref())
+      .zip(new_owned.by_ref())
       .all(|(new, prev)| new == prev)
     {
-      return Err(());
+      return Err(ReqBlockErr::InvariantFailed);
     }
     match new_owned.next() {
       Some(b) if b == new_block => {},
       // inserted wrong block
-      Some(_) => return Err(()),
+      Some(_) => return Err(ReqBlockErr::InvariantFailed),
       // no block seems to have been inserted
-      None => return Err(()),
+      None => return Err(ReqBlockErr::InvariantFailed),
     };
 
     if old_owned.next().is_some() {
       // Some block was removed and not kept in the new metadata
-      return Err(());
+      return Err(ReqBlockErr::InvariantFailed);
     }
     // perform updates after all checks
     self.free_map.set(new_block as usize);
@@ -474,14 +529,5 @@ where
         .filter_map(|v| Some(v.as_ref()?.len()))
         .sum::<usize>();
     num_bytes / B::BLOCK_SIZE
-  }
-
-  /// Persists the state of the global block interface, including allocated blocks, and metadata
-  pub fn persist_block_interface(&mut self)
-  where
-    [(); B::BLOCK_SIZE]: , {
-    // let num_blocks_required = self.own_required_blocks();
-    //let mut buf = [0; B::BLOCK_SIZE];
-    todo!()
   }
 }

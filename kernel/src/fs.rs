@@ -2,7 +2,7 @@ use crate::{
   bit_array::nearest_div_8,
   block_interface::{
     AllMetadata, BlockDevice, GlobalBlockInterface, Metadata, MetadataHandle, Owner,
-    FIRST_FREE_BLOCK,
+    FIRST_FREE_BLOCK, OWN_BLOCKS,
   },
   default_ser_impl,
 };
@@ -33,10 +33,11 @@ pub struct FileDescEntry {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct Directory {
   parent_inode: u32,
-  num_entries: u32,
+  num_entries: u8,
   // don't need to read through all of the entries here
-  inode_to_names: [([u8; 16], u16); 128],
+  inode_to_names: [([u8; 16], u16); 63],
 }
+
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct INode {
@@ -46,11 +47,37 @@ pub struct INode {
   data_blocks: [u16; 8],
 }
 
-#[repr(u16)]
+impl INode {
+  fn from_slice(s: &[u8]) -> Self {
+    assert_eq!(s.len(), core::mem::size_of::<Self>());
+    let mut data_blocks = [0u16; 8];
+    for i in 0..8 {
+      data_blocks[i] = u16::from_ne_bytes([s[7 + i * 2], s[8 + i * 2]]);
+    }
+    Self {
+      refs: u16::from_ne_bytes([s[0], s[1]]),
+      kind: INodeKind::from(s[2]),
+      file_size: u32::from_ne_bytes([s[3], s[4], s[5], s[6]]),
+      data_blocks,
+    }
+  }
+}
+
+#[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum INodeKind {
   File = 0,
   Directory = 1,
+}
+
+impl From<u8> for INodeKind {
+  fn from(v: u8) -> Self {
+    match v {
+      0 => INodeKind::File,
+      1 => INodeKind::Directory,
+      v => panic!("Unknown INodeKind {}", v),
+    }
+  }
 }
 
 const MAGIC_NUMBER: u32 = 0x101_0_F_0ff;
@@ -118,7 +145,7 @@ impl Metadata for RangeMetadata {
       return Ok(Self { start: b, count: 1 });
     }
     // Handle an extra block after the end of this one
-    if b == self.start + self.count + 1 {
+    if b == self.start + self.count {
       return Ok(Self {
         start: self.start,
         count: self.count + 1,
@@ -148,7 +175,6 @@ where
   open_files: [FileDescEntry; 256],
   inode_md: MetadataHandle,
   data_md: MetadataHandle,
-  root: u32,
   gbi: &'static mut GlobalBlockInterface<B>,
 }
 
@@ -157,21 +183,31 @@ where
   B: BlockDevice,
   [(); nearest_div_8(B::NUM_BLOCKS)]: ,
   [(); B::BLOCK_SIZE]: ,
+  [(); OWN_BLOCKS * B::BLOCK_SIZE]: ,
 {
   pub fn new(gbi: &'static mut GlobalBlockInterface<B>) -> Self {
-    let sb_mh = gbi.metadatas_for(Owner::LibFS).find_map(|(mh, amd)| {
-      if matches!(amd, AllMetadata::Superblock(_)) {
-        Some(mh)
-      } else {
-        None
-      }
-    });
-    if sb_mh.is_some() {
+    let sb_mh = gbi
+      .metadatas_for(Owner::LibFS)
+      .find_map(|(mh, amd)| matches!(amd, AllMetadata::Superblock(_)).then(|| mh));
+    if let Some(sb_mh) = sb_mh {
       // File system previously existed, reinitialize
-      todo!();
+      let mut mhs = gbi
+        .metadatas_for(Owner::LibFS)
+        .filter(|(mh, amd)| matches!(amd, AllMetadata::RangeMetadata(_)))
+        .map(|v| v.0);
+      let inode_mh = mhs.next().expect("Got inode metadata handle");
+      let data_mh = mhs.next().expect("Got inode metadata handle");
+      assert!(mhs.next().is_none());
+      drop(mhs);
+      Self {
+        superblock: sb_mh,
+        inode_md: inode_mh,
+        data_md: data_mh,
+        open_files: [FileDescEntry::default(); 256],
+        gbi,
+      }
     } else {
-      // Need to build new FS
-      return Self::mk(gbi);
+      Self::mk(gbi)
     }
   }
   /// Makes a new instance of this file system on this block interface
@@ -188,30 +224,69 @@ where
     for i in FIRST_FREE_BLOCK + 1..FIRST_FREE_BLOCK + 1 + 256 {
       gbi
         .req_block(inode_mh, i)
-        .expect("Failed to initialize Super block");
+        .expect("Failed to add block to inode");
     }
     let data_mh = gbi
-      .new_metadata::<Superblock>(Owner::LibFS)
+      .new_metadata::<RangeMetadata>(Owner::LibFS)
       .expect("Failed to mk data md");
     for i in FIRST_FREE_BLOCK + 1 + 256..FIRST_FREE_BLOCK + 1 + 256 + 1024 {
       gbi
         .req_block(data_mh, i)
-        .expect("Failed to initialize Super block");
+        .expect("Failed to add block to data");
     }
+    gbi.persist();
     Self {
       superblock: sb_mh,
       inode_md: inode_mh,
       data_md: data_mh,
       open_files: [FileDescEntry::default(); 256],
       // which block contains the first free node
-      root: FIRST_FREE_BLOCK + 1,
       gbi,
     }
   }
-  /// Opens a given path (always absolute)
-  pub fn open(&self, path: &[&str], mode: FileMode) -> Result<FileDescriptor, ()> {
-    let mut curr_inode: u32 = self.root;
-    for segment in path {}
+  fn inode(&self, i: usize) -> Result<INode, ()> {
+    let block = (i * core::mem::size_of::<INode>()) / B::BLOCK_SIZE;
+    let overlaps_end = block == (((i + 1) * core::mem::size_of::<INode>()) / B::BLOCK_SIZE);
+
+    if !overlaps_end {
+      let mut buf = [0; B::BLOCK_SIZE];
+      self.gbi.read(self.inode_md, block, &mut buf)?;
+      let offset = (i * core::mem::size_of::<INode>()) % B::BLOCK_SIZE;
+      Ok(INode::from_slice(
+        &buf[offset..offset + core::mem::size_of::<INode>()],
+      ))
+    } else {
+      todo!();
+    }
+  }
+  fn alloc_inode(&mut self) -> Result<INode, ()> {
+    self.gbi.modify_ref(self.superblock, |sb| {
+      if let &AllMetadata::Superblock(sb) = sb {
+        Ok(
+          Superblock {
+            num_inodes: sb.num_inodes + 1,
+            ..sb
+          }
+          .into(),
+        )
+      } else {
+        Err(())
+      }
+    })?;
+  }
+  /// Makes a directory at the given path in the current directory.
+  pub fn mkdir(&mut self, path: &str) -> Result<(), ()> {
+    todo!();
+  }
+  /// Opens a given path relative to dir.
+  pub fn open(
+    &self,
+    curr_dir: &Directory,
+    path: &[&str],
+    mode: FileMode,
+  ) -> Result<FileDescriptor, ()> {
+    // let mut curr_inode: u32 = self.root;
+    // for segment in path {}
     todo!()
   }
   pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
