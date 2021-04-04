@@ -22,7 +22,8 @@ impl BlockDevice for Driver {
     let mut f = f.lock().expect("Failed to lock file for reading");
     f.seek(SeekFrom::Start(block_num as u64 * Self::BLOCK_SIZE as u64))
       .expect("Failed to seek");
-    f.read(&mut dst[..Self::BLOCK_SIZE]).map_err(|_| ())
+    let len = dst.len().min(Self::BLOCK_SIZE);
+    f.read(&mut dst[..len]).map_err(|_| ())
   }
   fn write(&self, block_num: u32, dst: &[u8]) -> Result<usize, ()> {
     let f = self.backing.as_ref().unwrap();

@@ -14,6 +14,7 @@
   associated_type_defaults,
   pub_macro_rules,
   generic_associated_types,
+  array_methods,
   with_options
 )]
 #![allow(unused, incomplete_features)]
