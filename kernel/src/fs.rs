@@ -22,6 +22,13 @@ impl Default for FileMode {
   fn default() -> Self { Self::R }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SeekFrom {
+  Start(u32),
+  End(i32),
+  Current(i32),
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct FileDescEntry {
   inode: u32,
@@ -85,6 +92,7 @@ impl Directory {
       .swap(entry_num, (self.num_added - 1) as usize);
     self.num_added -= 1;
   }
+  default_ser_impl!();
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -247,7 +255,7 @@ where
   [(); nearest_div_8(B::NUM_BLOCKS)]: ,
   [(); B::BLOCK_SIZE]: , {
   superblock: MetadataHandle,
-  open_files: [FileDescEntry; 256],
+  file_descs: [FileDescEntry; 256],
   inode_md: MetadataHandle,
   data_md: MetadataHandle,
   inode_alloc_map: BitArray<1024>,
@@ -283,7 +291,7 @@ where
         data_md: data_mh,
         inode_alloc_map: BitArray::new(false),
         data_alloc_map: BitArray::new(false),
-        open_files: [FileDescEntry::default(); 256],
+        file_descs: [FileDescEntry::default(); 256],
         gbi,
       };
       out.load_allocs().expect("Failed to load alloc map");
@@ -326,16 +334,88 @@ where
       data_md: data_mh,
       inode_alloc_map: BitArray::new(false),
       data_alloc_map: BitArray::new(false),
-      open_files: [FileDescEntry::default(); 256],
+      file_descs: [FileDescEntry::default(); 256],
       gbi,
     };
     // make root directory at inode 0.
-    let mut root_dir_inode = out
-      .alloc_inode(&INode::new(INodeKind::Directory))
+    let mut root_dir_inode = INode::new(INodeKind::Directory);
+    let root_dir_inode_num = out
+      .alloc_inode(&root_dir_inode)
       .expect("Failed to allocate inode for root directory");
-    assert_eq!(root_dir_inode, 0, "Unexpected inode for root dir");
+    assert_eq!(root_dir_inode_num, 0, "Unexpected inode 0 for root dir");
     let root_dir = Directory::new(0, 0);
+    /// Writes the root dir to the first inode
+    out.write_to_inode(&mut root_dir_inode, root_dir.ser(), 0);
+    out.save_inode(&root_dir_inode, root_dir_inode_num as usize)
+      .expect("Failed to save root dir inode");
     out
+  }
+  /// Opens a file to the root directory of the file system.
+  pub fn root_dir(&mut self, mode: FileMode) -> Result<FileDescriptor, ()> {
+    let (i, fd) = self
+      .file_descs
+      .iter_mut()
+      .enumerate()
+      .find(|(_, fd)| fd.open_refs == 0)
+      .ok_or(())?;
+    fd.inode = 0;
+    fd.open_refs += 1;
+    fd.offset = 0;
+    fd.mode = mode;
+    Ok(FileDescriptor(i as u32))
+  }
+  /// Seeks inside of a file
+  pub fn seek(&mut self, FileDescriptor(fdi): FileDescriptor, s: SeekFrom) -> Result<(), ()> {
+    let fdi = fdi as usize;
+    let fd = self.file_descs.get_mut(fdi).ok_or(())?;
+    match s {
+      SeekFrom::Start(v) => fd.offset = v,
+      SeekFrom::End(v) => {
+        let inode_num = fd.inode;
+        drop(fd);
+        let inode = self.load_inode(inode_num as usize)?;
+        let dst = inode.size as i32 + v;
+        if dst < 0 {
+          return Err(());
+        }
+        self.file_descs[fdi].offset = dst as u32;
+      },
+      SeekFrom::Current(v) => {
+        let dst = fd.offset as i32 + v;
+        if dst < 0 {
+          return Err(());
+        }
+        fd.offset = dst as u32;
+      },
+    }
+    Ok(())
+  }
+  pub fn read(&mut self, FileDescriptor(fdi): FileDescriptor, dst: &mut [u8]) -> Result<usize, ()> {
+    let fdi = fdi as usize;
+    let fd = self.file_descs.get(fdi).ok_or(())?.clone();
+    if fd.mode == FileMode::W {
+      return Err(());
+    }
+    let inode = self.load_inode(fd.inode as usize)?;
+    let read = self.read_from_inode(&inode, dst, fd.offset)?;
+    self.file_descs[fdi].offset += read as u32;
+    Ok(read)
+  }
+  pub fn write(
+    &mut self,
+    FileDescriptor(fdi): FileDescriptor,
+    src: &mut [u8],
+  ) -> Result<usize, ()> {
+    let fdi = fdi as usize;
+    let fd = self.file_descs.get(fdi).ok_or(())?.clone();
+    if fd.mode == FileMode::R {
+      return Err(());
+    }
+    let mut inode = self.load_inode(fd.inode as usize)?;
+    let written = self.write_to_inode(&mut inode, src, fd.offset)?;
+    self.save_inode(&inode, fd.inode as usize)?;
+    self.file_descs[fdi].offset += written as u32;
+    Ok(written)
   }
   #[inline]
   const fn num_inode_blocks() -> usize {
@@ -377,6 +457,7 @@ where
       ))
     }
   }
+  #[must_use]
   fn save_inode(&self, inode: &INode, i: usize) -> Result<(), ()> {
     assert!(
       self.inode_alloc_map.get(i as usize),
@@ -402,7 +483,7 @@ where
   /// Given an inode, saves it and returns the inode number it was given
   fn alloc_inode(&mut self, inode: &INode) -> Result<u32, ()> {
     let inode_num = self.inode_alloc_map.find_free().ok_or(())? as u32;
-    self.save_inode(inode, inode_num as usize);
+    self.save_inode(inode, inode_num as usize)?;
     self.inode_alloc_map.set(inode_num as usize);
     self.persist_allocs()?;
     Ok(inode_num)
@@ -435,7 +516,7 @@ where
   }
   pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
     let i = i as usize;
-    let open_file = &mut self.open_files[i];
+    let open_file = &mut self.file_descs[i];
     if open_file.open_refs == 0 {
       return Err(());
     }
@@ -464,7 +545,7 @@ where
   }
 
   /// Writes a byte array to an inode
-  fn write_to_inode(&mut self, inode: &mut INode, data: &[u8], offset: u32) -> Result<(), ()> {
+  fn write_to_inode(&mut self, inode: &mut INode, data: &[u8], offset: u32) -> Result<usize, ()> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = (offset + data.len() as u32);
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
@@ -493,10 +574,10 @@ where
       written += self.gbi.write(self.data_md, db, &buf)?;
     }
     assert_eq!(written, data.len());
-    Ok(())
+    Ok(written)
   }
   /// Writes a byte array to an inode
-  fn read_from_inode(&mut self, inode: &INode, dst: &mut [u8], offset: u32) -> Result<(), ()> {
+  fn read_from_inode(&mut self, inode: &INode, dst: &mut [u8], offset: u32) -> Result<usize, ()> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = (offset + dst.len() as u32);
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
@@ -517,7 +598,6 @@ where
       dst[read..read_buf.len()].copy_from_slice(read_buf);
       read += read_buf.len();
     }
-    assert_eq!(read, dst.len());
-    Ok(())
+    Ok(read)
   }
 }
