@@ -483,8 +483,8 @@ where
   /// Given an inode, saves it and returns the inode number it was given
   fn alloc_inode(&mut self, inode: &INode) -> Result<u32, ()> {
     let inode_num = self.inode_alloc_map.find_free().ok_or(())? as u32;
-    self.save_inode(inode, inode_num as usize)?;
     self.inode_alloc_map.set(inode_num as usize);
+    self.save_inode(inode, inode_num as usize)?;
     self.persist_allocs()?;
     Ok(inode_num)
   }
@@ -569,9 +569,12 @@ where
     for i in start_block..end_block as u32 {
       let db = inode.data_blocks[i as usize] as usize;
       assert_eq!(self.gbi.read(self.data_md, db, &mut buf)?, B::BLOCK_SIZE);
-      let write_buf = &mut buf[(written + offset as usize) % B::BLOCK_SIZE..];
-      write_buf.copy_from_slice(&data[written..write_buf.len()]);
-      written += self.gbi.write(self.data_md, db, &buf)?;
+      let rem = B::BLOCK_SIZE.min(data.len() - written as usize);
+      let write_buf = &mut buf[(written + offset as usize) % B::BLOCK_SIZE..rem];
+      debug_assert_ne!(write_buf.len(), 0);
+      write_buf.copy_from_slice(&data[written..written+write_buf.len()]);
+      written += write_buf.len();
+      self.gbi.write(self.data_md, db, &buf)?;
     }
     assert_eq!(written, data.len());
     Ok(written)
@@ -594,10 +597,13 @@ where
     for i in start_block..end_block.min(curr_blocks) as u32 {
       let db = inode.data_blocks[i as usize] as usize;
       assert_eq!(self.gbi.read(self.data_md, db, &mut buf)?, B::BLOCK_SIZE);
-      let read_buf = &buf[(read + offset as usize) % B::BLOCK_SIZE..];
-      dst[read..read_buf.len()].copy_from_slice(read_buf);
+      let rem = B::BLOCK_SIZE.min(dst.len() - read as usize);
+      let read_buf = &buf[(read + offset as usize) % B::BLOCK_SIZE..rem];
+      debug_assert_ne!(read_buf.len(), 0);
+      dst[read..read+read_buf.len()].copy_from_slice(read_buf);
       read += read_buf.len();
     }
+    assert_eq!(read, dst.len());
     Ok(read)
   }
 }
