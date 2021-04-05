@@ -458,7 +458,6 @@ where
     let md = md.as_ref().ok_or(ReqBlockErr::NoSuchMetadata)?;
     let mut old_owned = md.owned();
 
-    // println!("{:?} {}", md, new_block);
     let new_md = md.insert(new_block).map_err(|_| ReqBlockErr::Internal)?;
 
     let mut new_owned = new_md.owned();
@@ -515,6 +514,7 @@ where
     let md = &self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
     let b_n = md.owned().nth(n).ok_or(())?;
+    println!("-- Writing to block: {}", b_n);
 
     self.block_device.write(b_n, src)
   }

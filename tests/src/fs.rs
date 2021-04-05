@@ -37,6 +37,11 @@ pub struct FileDescEntry {
   mode: FileMode,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct FileStat {
+  size: u32,
+}
+
 const NUM_ENTRIES: usize = 64;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Directory {
@@ -71,11 +76,16 @@ impl Directory {
   }
   /// Inserts an entry into this directory
   // TODO convert this into a result type
-  pub fn insert(&mut self, name: &str, to: u32) {
-    assert!(
-      (self.num_added as usize) < NUM_ENTRIES,
-      "Directory out of space"
-    );
+  pub fn insert(&mut self, name: &str, to: u32) -> Result<(), ()> {
+    if self.num_added as usize >= NUM_ENTRIES {
+      // TODO directory out of space
+      return Err(());
+    }
+    if self.contains(name) {
+      // TODO already contains file with that name
+      return Err(());
+    }
+    //  TODO check other names if they match
     let bytes = name.as_bytes();
     assert!(bytes.len() < 48, "Cannot store names this long currently.");
     let len = bytes.len();
@@ -84,6 +94,38 @@ impl Directory {
     self.name_to_inode_map[idx].0[47] = len as u8;
     self.name_to_inode_map[idx].1 = to;
     self.num_added += 1;
+    Ok(())
+  }
+  /// Finds an entry in the directory
+  pub fn inode_of(&self, name: &str) -> Option<u32> {
+    if "." == name {
+      return Some(self.own_inode);
+    } else if ".." == name {
+      return Some(self.parent_inode);
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() > 47 {
+      return None;
+    }
+    self
+      .name_to_inode_map
+      .iter()
+      .take(self.num_added as usize)
+      .find_map(|(fname, inode)| fname[..fname[47] as usize].eq(bytes).then(|| *inode))
+  }
+  #[inline]
+  pub fn contains(&mut self, name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() > 47 {
+      return false;
+    }
+    "." == name
+      || ".." == name
+      || self
+        .name_to_inode_map
+        .iter()
+        .take(self.num_added as usize)
+        .any(|(fname, inode)| fname[..fname[47] as usize].eq(bytes))
   }
   /// Removes an entry from this directory
   pub fn remove(&mut self, entry_num: usize) {
@@ -97,6 +139,7 @@ impl Directory {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct INode {
+  /// Number of links to this inode
   refs: u16,
   kind: INodeKind,
   size: u32,
@@ -346,7 +389,8 @@ where
     let root_dir = Directory::new(0, 0);
     /// Writes the root dir to the first inode
     out.write_to_inode(&mut root_dir_inode, root_dir.ser(), 0);
-    out.save_inode(&root_dir_inode, root_dir_inode_num as usize)
+    out
+      .save_inode(&root_dir_inode, root_dir_inode_num as usize)
       .expect("Failed to save root dir inode");
     out
   }
@@ -390,32 +434,42 @@ where
     }
     Ok(())
   }
+  ///
   pub fn read(&mut self, FileDescriptor(fdi): FileDescriptor, dst: &mut [u8]) -> Result<usize, ()> {
     let fdi = fdi as usize;
-    let fd = self.file_descs.get(fdi).ok_or(())?.clone();
+    let fd = self.file_descs.get(fdi).ok_or(())?;
+    let offset = fd.offset;
     if fd.mode == FileMode::W {
       return Err(());
     }
     let inode = self.load_inode(fd.inode as usize)?;
-    let read = self.read_from_inode(&inode, dst, fd.offset)?;
+    if inode.kind == INodeKind::Directory {
+      assert_eq!(dst.len(), core::mem::size_of::<Directory>());
+    }
+    let read = self.read_from_inode(&inode, dst, offset)?;
     self.file_descs[fdi].offset += read as u32;
     Ok(read)
   }
-  pub fn write(
-    &mut self,
-    FileDescriptor(fdi): FileDescriptor,
-    src: &mut [u8],
-  ) -> Result<usize, ()> {
+  pub fn write(&mut self, FileDescriptor(fdi): FileDescriptor, src: &[u8]) -> Result<usize, ()> {
     let fdi = fdi as usize;
     let fd = self.file_descs.get(fdi).ok_or(())?.clone();
     if fd.mode == FileMode::R {
       return Err(());
     }
     let mut inode = self.load_inode(fd.inode as usize)?;
+    if inode.kind == INodeKind::Directory {
+      assert_eq!(src.len(), core::mem::size_of::<Directory>());
+    }
     let written = self.write_to_inode(&mut inode, src, fd.offset)?;
     self.save_inode(&inode, fd.inode as usize)?;
     self.file_descs[fdi].offset += written as u32;
     Ok(written)
+  }
+  pub fn stat(&self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, ()> {
+    let fdi = fdi as usize;
+    let fd = self.file_descs.get(fdi).ok_or(())?;
+    let mut inode = self.load_inode(fd.inode as usize)?;
+    Ok(FileStat { size: inode.size })
   }
   #[inline]
   const fn num_inode_blocks() -> usize {
@@ -466,10 +520,17 @@ where
     let (block, offset, overlaps_end) = Self::inode_block_and_offset_and_wraps(i);
     if !overlaps_end {
       let mut buf = [0u8; B::BLOCK_SIZE];
+      self.gbi.read(self.inode_md, block, &mut buf)?;
       inode.to_slice(&mut buf[offset..offset + core::mem::size_of::<INode>()]);
       self.gbi.write(self.inode_md, block, &buf)?;
     } else {
       let mut buf = [0u8; 2 * B::BLOCK_SIZE];
+      self
+        .gbi
+        .read(self.inode_md, block, &mut buf[..B::BLOCK_SIZE])?;
+      self
+        .gbi
+        .read(self.inode_md, block + 1, &mut buf[B::BLOCK_SIZE..])?;
       inode.to_slice(&mut buf[offset..offset + core::mem::size_of::<INode>()]);
       self
         .gbi
@@ -505,14 +566,71 @@ where
   }
   /// Opens a given path relative to dir.
   pub fn open(
-    &self,
-    curr_dir: &Directory,
+    &mut self,
+    // Inside of which directory?
+    FileDescriptor(fdi): FileDescriptor,
     path: &[&str],
     mode: FileMode,
   ) -> Result<FileDescriptor, ()> {
-    // let mut curr_inode: u32 = self.root;
-    // for segment in path {}
-    todo!()
+    if path.is_empty() {
+      // Must have at least one entry in the path
+      return Err(());
+    }
+    let mut curr_dir_inode_num = self.file_descs.get(fdi as usize).ok_or(())?.inode;
+    let mut curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
+    if curr_dir_inode.kind != INodeKind::Directory {
+      // println!("{:?} {:?}", curr_dir_inode, curr_dir_inode_num);
+      // Can't create a file inside of something which isn't a directory
+      return Err(());
+    }
+    let mut buf = [0u8; core::mem::size_of::<Directory>()];
+    self.read_from_inode(&curr_dir_inode, &mut buf, 0)?;
+    let mut curr_dir: Directory = unsafe { core::mem::transmute(buf) };
+    for subdir in path.iter().take(path.len() - 1) {
+      curr_dir_inode_num = curr_dir.inode_of(subdir).ok_or(())?;
+      curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
+      let mut buf: [u8; core::mem::size_of::<Directory>()] =
+        unsafe { core::mem::transmute(curr_dir) };
+      self.read_from_inode(&curr_dir_inode, &mut buf, 0);
+      curr_dir = unsafe { core::mem::transmute(buf) };
+    }
+    let last_entry = path.last().unwrap();
+    let inode_num = if let Some(inode_num) = curr_dir.inode_of(last_entry) {
+      inode_num
+    } else if mode != FileMode::R {
+      let inode = INode::new(INodeKind::File);
+      let inode_num = self.alloc_inode(&inode)?;
+      curr_dir
+        .insert(last_entry, inode_num)
+        .expect("Failed to insert name into directory");
+      let mut buf: [u8; core::mem::size_of::<Directory>()] =
+        unsafe { core::mem::transmute(curr_dir) };
+      self.write_to_inode(&mut curr_dir_inode, &buf, 0)?;
+      self.save_inode(&curr_dir_inode, curr_dir_inode_num as usize)?;
+      inode_num
+    } else
+    /* mode == FileMode::R */
+    {
+      return Err(());
+    };
+    let (i, fd) = self
+      .file_descs
+      .iter_mut()
+      .enumerate()
+      .find(|(_, fd)| fd.open_refs == 0)
+      .ok_or(())?;
+    fd.inode = inode_num;
+    fd.offset = 0;
+    fd.open_refs += 1;
+    fd.mode = mode;
+    Ok(FileDescriptor(i as u32))
+  }
+  /// Unlinks a file in the given directory.
+  pub fn unlink(&mut self, FileDescriptor(i): FileDescriptor, path: &[&str]) -> Result<(), ()> {
+    if path.is_empty() {
+      return Err(());
+    }
+    todo!();
   }
   pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
     let i = i as usize;
@@ -557,7 +675,7 @@ where
     let curr_blocks = (inode.size as usize + B::BLOCK_SIZE - 1) / B::BLOCK_SIZE;
     // TODO check the number of free data blocks before and abort early if so;
     if curr_blocks < end_block {
-      for i in curr_blocks + 1..end_block {
+      for i in curr_blocks..end_block {
         let free_db = self.data_alloc_map.find_free().ok_or(())?;
         inode.data_blocks[i] = free_db as u16;
         self.data_alloc_map.set(free_db);
@@ -568,11 +686,13 @@ where
     let mut buf = [0; B::BLOCK_SIZE];
     for i in start_block..end_block as u32 {
       let db = inode.data_blocks[i as usize] as usize;
-      assert_eq!(self.gbi.read(self.data_md, db, &mut buf)?, B::BLOCK_SIZE);
-      let rem = B::BLOCK_SIZE.min(data.len() - written as usize);
-      let write_buf = &mut buf[(written + offset as usize) % B::BLOCK_SIZE..rem];
+      let read = self.gbi.read(self.data_md, db, &mut buf)?;
+      assert_eq!(read, B::BLOCK_SIZE);
+      let start = (written + offset as usize) % B::BLOCK_SIZE;
+      let end = B::BLOCK_SIZE.min(start + data.len() - written as usize);
+      let write_buf = &mut buf[start..end];
       debug_assert_ne!(write_buf.len(), 0);
-      write_buf.copy_from_slice(&data[written..written+write_buf.len()]);
+      write_buf.copy_from_slice(&data[written..written + write_buf.len()]);
       written += write_buf.len();
       self.gbi.write(self.data_md, db, &buf)?;
     }
@@ -600,7 +720,7 @@ where
       let rem = B::BLOCK_SIZE.min(dst.len() - read as usize);
       let read_buf = &buf[(read + offset as usize) % B::BLOCK_SIZE..rem];
       debug_assert_ne!(read_buf.len(), 0);
-      dst[read..read+read_buf.len()].copy_from_slice(read_buf);
+      dst[read..read + read_buf.len()].copy_from_slice(read_buf);
       read += read_buf.len();
     }
     assert_eq!(read, dst.len());

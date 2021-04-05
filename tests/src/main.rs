@@ -38,7 +38,22 @@ fn main() {
   global_block_interface()
     .try_init()
     .expect("Failed to init global block interface");
-  let fs = fs::FileSystem::new(global_block_interface());
+  let mut fs = fs::FileSystem::new(global_block_interface());
+  let root_dir_fd = fs
+    .root_dir(fs::FileMode::R)
+    .expect("Failed to open root dir");
+  println!("{:?}", root_dir_fd);
+  let fd = fs
+    .open(root_dir_fd, &["test.txt"], fs::FileMode::RW)
+    .expect("Failed to open test file");
+  let mut example = b"A bunch of text";
+  fs.seek(fd, fs::SeekFrom::End(0));
+  fs.write(fd, example.as_slice());
+  println!("{:?}", fs.stat(fd));
+  /*
+  println!("{:?}", fd);
+  println!("{:?}", fs.stat(fd));
+  */
 }
 
 #[test]
