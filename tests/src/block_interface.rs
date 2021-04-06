@@ -224,7 +224,7 @@ where
   // but its representation might be generalizable. For now just go with a bit array.
   free_map: BitArray<{ B::NUM_BLOCKS }>,
 
-  block_device: B,
+  pub(crate) block_device: B,
 }
 
 /// A capability for metadata.
@@ -514,7 +514,6 @@ where
     let md = &self.stored.get(i).ok_or(())?;
     let md = md.as_ref().ok_or(())?;
     let b_n = md.owned().nth(n).ok_or(())?;
-    println!("-- Writing to block: {}", b_n);
 
     self.block_device.write(b_n, src)
   }

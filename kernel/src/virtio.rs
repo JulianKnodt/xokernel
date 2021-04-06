@@ -1,5 +1,5 @@
 use crate::{block_interface::BlockDevice, pci};
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Driver {}
 
 impl BlockDevice for Driver {
@@ -7,7 +7,58 @@ impl BlockDevice for Driver {
   const BLOCK_SIZE: usize = 512;
   fn read(&self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()> { todo!() }
   fn write(&self, block_num: u32, src: &[u8]) -> Result<usize, ()> { todo!() }
-  fn init(&mut self) {}
+  fn init(&mut self) {
+    // TODO get headers from here?
+    let header = pci::init_block_device_on_pci();
+    // Reset device
+    // Set Ack bit
+    // read device feature bits, write subset of features bits supported by us
+    // Set FeatOk status bit
+    // Reread device status to ensure that feature bits all still set
+    // discovery of virtqueues
+    // write virtio config space
+    // populate virtqueues
+  }
+}
+
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum VirtioPCICapCfg {
+  /* Common configuration */
+  CommonCfg = 1,
+  /* Notifications */
+  NotifyCfg = 2,
+  /* ISR Status */
+  ISR = 3,
+  /* Device specific configuration */
+  Device = 4,
+  /* PCI configuration access */
+  PCI = 5,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct VirtioPCICap {
+  cap_vndr: u8,              /* Generic PCI field: PCI_CAP_ID_VNDR */
+  cap_next: u8,              /* Generic PCI field: next ptr. */
+  cap_len: u8,               /* Generic PCI field: capability length */
+  cfg_type: VirtioPCICapCfg, /* Identifies the structure. */
+  bar: u8,                   /* Where to find it. */
+  padding: [u8; 3],          /* Pad to full dword. */
+  // The fields below should be encoded in memory as little endian
+  offset: u32, /* Offset within bar. */
+  length: u32, /* Length of the structure, in bytes. */
+}
+
+#[repr(u8)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum VirtioDeviceStatus {
+  Ack = 1,
+  Driver = 2,
+  Failed = 128,
+  FeaturesOk = 8,
+  DriverOk = 4,
+  DeviceNeedsReset = 64,
 }
 
 impl Driver {

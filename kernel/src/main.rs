@@ -15,6 +15,7 @@
   const_evaluatable_checked,
   associated_type_defaults,
   generic_associated_types,
+  array_methods,
   pub_macro_rules
 )]
 #![allow(unused, incomplete_features)]
@@ -112,7 +113,7 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
   //  vga_buffer::print_at(b"Panicked with {}", 24, 0);
-  write!(vga_buffer::Writer::new(23, 0), "{}", info,);
+  write!(vga_buffer::Writer::new(21, 0), "{}", info,);
   loop {}
 }
 

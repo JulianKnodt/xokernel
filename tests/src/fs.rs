@@ -134,6 +134,17 @@ impl Directory {
       .swap(entry_num, (self.num_added - 1) as usize);
     self.num_added -= 1;
   }
+  pub fn index_of(&self, name: &str) -> Option<usize> {
+    let bytes = name.as_bytes();
+    if bytes.len() > 47 || name == "." || name == ".." {
+      return None;
+    }
+    self
+      .name_to_inode_map
+      .iter()
+      .take(self.num_added as usize)
+      .position(|(fname, inode)| fname[..fname[47] as usize].eq(bytes))
+  }
   default_ser_impl!();
 }
 
@@ -481,10 +492,12 @@ where
   }
   /// Returns the position of an inode and whether it wraps around to a second block
   const fn inode_block_and_offset_and_wraps(i: usize) -> (usize, usize, bool) {
-    let block = (i * core::mem::size_of::<INode>()) / B::BLOCK_SIZE;
-    let overlaps_end = block == (((i + 1) * core::mem::size_of::<INode>()) / B::BLOCK_SIZE);
+    // Should round down
+    let bl = (i * core::mem::size_of::<INode>()) / B::BLOCK_SIZE;
+    let next_bl = (((i + 1) * core::mem::size_of::<INode>()) / B::BLOCK_SIZE);
+    let wraps = (bl != next_bl);
     let offset = (i * core::mem::size_of::<INode>()) % B::BLOCK_SIZE;
-    (block, offset, overlaps_end)
+    (bl, offset, wraps)
   }
   fn load_inode(&self, i: usize) -> Result<INode, ()> {
     assert!(
@@ -517,8 +530,8 @@ where
       self.inode_alloc_map.get(i as usize),
       "Unallocated inode is being saved"
     );
-    let (block, offset, overlaps_end) = Self::inode_block_and_offset_and_wraps(i);
-    if !overlaps_end {
+    let (block, offset, wraps) = Self::inode_block_and_offset_and_wraps(i);
+    if !wraps {
       let mut buf = [0u8; B::BLOCK_SIZE];
       self.gbi.read(self.inode_md, block, &mut buf)?;
       inode.to_slice(&mut buf[offset..offset + core::mem::size_of::<INode>()]);
@@ -626,11 +639,44 @@ where
     Ok(FileDescriptor(i as u32))
   }
   /// Unlinks a file in the given directory.
-  pub fn unlink(&mut self, FileDescriptor(i): FileDescriptor, path: &[&str]) -> Result<(), ()> {
+  pub fn unlink(&mut self, FileDescriptor(fdi): FileDescriptor, path: &[&str]) -> Result<(), ()> {
     if path.is_empty() {
       return Err(());
     }
-    todo!();
+    let mut curr_dir_inode_num = self.file_descs.get(fdi as usize).ok_or(())?.inode;
+    let mut curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
+    if curr_dir_inode.kind != INodeKind::Directory {
+      // println!("{:?} {:?}", curr_dir_inode, curr_dir_inode_num);
+      // Can't create a file inside of something which isn't a directory
+      return Err(());
+    }
+    let mut buf = [0u8; core::mem::size_of::<Directory>()];
+    self.read_from_inode(&curr_dir_inode, &mut buf, 0)?;
+    let mut curr_dir: Directory = unsafe { core::mem::transmute(buf) };
+    for subdir in path.iter().take(path.len() - 1) {
+      curr_dir_inode_num = curr_dir.inode_of(subdir).ok_or(())?;
+      curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
+      let mut buf: [u8; core::mem::size_of::<Directory>()] =
+        unsafe { core::mem::transmute(curr_dir) };
+      self.read_from_inode(&curr_dir_inode, &mut buf, 0);
+      curr_dir = unsafe { core::mem::transmute(buf) };
+    }
+    let last_entry = path.last().unwrap();
+    let inode_num = curr_dir.inode_of(last_entry).ok_or(())?;
+    let mut inode = self.load_inode(inode_num as usize)?;
+    if inode.kind == INodeKind::Directory {
+      // Do not permit removing directories for now
+      // TODO either check if the directory is empty or allow for -r arguments to this function
+      return Err(());
+    }
+    inode.refs -= 1;
+    self.save_inode(&inode, inode_num as usize);
+    curr_dir.remove(curr_dir.index_of(last_entry).unwrap());
+    let mut buf: [u8; core::mem::size_of::<Directory>()] =
+      unsafe { core::mem::transmute(curr_dir) };
+    self.write_to_inode(&mut curr_dir_inode, &buf, 0)?;
+    self.save_inode(&curr_dir_inode, curr_dir_inode_num as usize)?;
+    Ok(())
   }
   pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
     let i = i as usize;

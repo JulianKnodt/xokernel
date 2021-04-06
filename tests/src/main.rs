@@ -23,11 +23,13 @@ pub mod bit_array;
 pub mod block_interface;
 pub mod fs;
 pub mod linux_files;
+#[cfg(test)]
+mod tests;
 
 use block_interface::*;
 
 static mut GLOBAL_BLOCK_INTERFACE: GlobalBlockInterface<linux_files::Driver> =
-  GlobalBlockInterface::new(linux_files::Driver::new());
+  GlobalBlockInterface::new(linux_files::Driver::new("diskblocks"));
 
 // TODO maybe move this into main because it doesn't need to be defined in this file.
 pub fn global_block_interface() -> &'static mut GlobalBlockInterface<linux_files::Driver> {
@@ -47,17 +49,24 @@ fn main() {
     .open(root_dir_fd, &["test.txt"], fs::FileMode::RW)
     .expect("Failed to open test file");
   let mut example = b"A bunch of text";
-  fs.seek(fd, fs::SeekFrom::End(0));
-  fs.write(fd, example.as_slice());
+  fs.seek(fd, fs::SeekFrom::End(0)).expect("Failed to seek");
+  fs.write(fd, example.as_slice()).expect("Failed to write");
   println!("{:?}", fs.stat(fd));
-  /*
-  println!("{:?}", fd);
-  println!("{:?}", fs.stat(fd));
-  */
+  let mut buf = [0; 15];
+  assert_eq!(buf.len(), example.len());
+  fs.seek(fd, fs::SeekFrom::Start(0)).expect("Failed to seek");
+  fs.read(fd, &mut buf[..]).expect("Failed to read");
+  println!(
+    "{:?}",
+    core::str::from_utf8(&buf).expect("did not get valid utf8")
+  );
+  fs.unlink(root_dir_fd, &["test.txt"])
+    .expect("Failed to unlink");
 }
 
 #[test]
-fn test() {
+fn bit_array_basic() {
+  use bit_array::BitArray;
   let mut b = BitArray::<4096>::new(false);
   for i in 0..1000 {
     b.set(i);
