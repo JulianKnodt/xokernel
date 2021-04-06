@@ -763,8 +763,9 @@ where
     for i in start_block..end_block.min(curr_blocks) as u32 {
       let db = inode.data_blocks[i as usize] as usize;
       assert_eq!(self.gbi.read(self.data_md, db, &mut buf)?, B::BLOCK_SIZE);
-      let rem = B::BLOCK_SIZE.min(dst.len() - read as usize);
-      let read_buf = &buf[(read + offset as usize) % B::BLOCK_SIZE..rem];
+      let start = (read + offset as usize) % B::BLOCK_SIZE;
+      let end = B::BLOCK_SIZE.min(start + dst.len() - read as usize);
+      let read_buf = &buf[start..end];
       debug_assert_ne!(read_buf.len(), 0);
       dst[read..read + read_buf.len()].copy_from_slice(read_buf);
       read += read_buf.len();
