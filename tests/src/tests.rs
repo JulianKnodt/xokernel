@@ -65,3 +65,59 @@ fs_test!(read_files_from_root_dir, |gfs| {
     assert_eq!(&buf, static_str);
   }
 });
+
+fs_test!(open_and_close_a_lot, |gfs| {
+  let root_dir_fd = gfs
+    .root_dir(fs::FileMode::R)
+    .expect("failed to open root dir");
+  for i in 0..50 {
+    let _ = gfs
+      .open(root_dir_fd, &[&i.to_string()], fs::FileMode::RW)
+      .expect(&format!("Failed to create {}", i));
+    let foo_bar = b"foo_bar";
+    let () = gfs
+      .unlink(root_dir_fd, &[&i.to_string()])
+      .expect(&format!("Failed to unlink {}", i));
+  }
+  let dir = gfs
+    .as_directory(root_dir_fd)
+    .expect("Failed to get directory");
+
+  assert_eq!(dir.entries().count(), 2);
+  assert_eq!(dir.num_added, 0);
+});
+
+fs_test!(nested_directories, |gfs| {
+  let root_dir_fd = gfs
+    .root_dir(fs::FileMode::R)
+    .expect("failed to open root dir");
+  let dir2_fd = gfs.mkdir(root_dir_fd, "example_dir").expect("Failed to make directory");
+
+  let dir = gfs
+    .as_directory(root_dir_fd)
+    .expect("Failed to get directory");
+  let dir2 = gfs
+    .as_directory(dir2_fd)
+    .expect("Failed to get directory");
+
+  assert_eq!(dir.entries().count(), 3);
+  assert_eq!(dir.num_added, 1);
+
+  assert_eq!(dir2.entries().count(), 2);
+  assert_eq!(dir2.num_added, 0);
+
+  let new_fd = gfs.open(dir2_fd, &["test.txt"], fs::FileMode::RW).expect("Failed to open file");
+  gfs.write(new_fd, (b"Example text").as_slice()).unwrap();
+  gfs.seek(new_fd, fs::SeekFrom::Start(0));
+  let mut buf = [0; 12];
+  gfs.read(new_fd, &mut buf).unwrap();
+  assert_eq!("Example text".as_bytes(), &buf);
+
+  // need to pull directory which is not updated.
+  let dir2 = gfs
+    .as_directory(dir2_fd)
+    .expect("Failed to get directory");
+
+  assert_eq!(dir2.entries().count(), 3);
+  assert_eq!(dir2.num_added, 1);
+});

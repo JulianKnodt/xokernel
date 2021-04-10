@@ -47,7 +47,7 @@ const NUM_ENTRIES: usize = 64;
 pub struct Directory {
   parent_inode: u32,
   own_inode: u32,
-  num_added: u8,
+  pub(crate) num_added: u8,
   name_to_inode_map: [([u8; 48], u32); NUM_ENTRIES],
 }
 
@@ -573,10 +573,6 @@ where
     self.persist_allocs()?;
     Ok(())
   }
-  /// Makes a directory at the given path in the current directory.
-  pub fn mkdir(&mut self, curr_dir: &Directory, path: &str) -> Result<(), ()> {
-    todo!();
-  }
   /// Opens a given path relative to dir.
   pub fn open(
     &mut self,
@@ -602,6 +598,9 @@ where
     for subdir in path.iter().take(path.len() - 1) {
       curr_dir_inode_num = curr_dir.inode_of(subdir).ok_or(())?;
       curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
+      if curr_dir_inode.kind != INodeKind::Directory {
+        return Err(());
+      }
       let mut buf: [u8; core::mem::size_of::<Directory>()] =
         unsafe { core::mem::transmute(curr_dir) };
       self.read_from_inode(&curr_dir_inode, &mut buf, 0);
@@ -638,7 +637,7 @@ where
     fd.mode = mode;
     Ok(FileDescriptor(i as u32))
   }
-  /// Unlinks a file in the given directory.
+  /// Unlinks a file in the directory given by the file descriptor, following the path.
   pub fn unlink(&mut self, FileDescriptor(fdi): FileDescriptor, path: &[&str]) -> Result<(), ()> {
     if path.is_empty() {
       return Err(());
@@ -646,7 +645,6 @@ where
     let mut curr_dir_inode_num = self.file_descs.get(fdi as usize).ok_or(())?.inode;
     let mut curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
     if curr_dir_inode.kind != INodeKind::Directory {
-      // println!("{:?} {:?}", curr_dir_inode, curr_dir_inode_num);
       // Can't create a file inside of something which isn't a directory
       return Err(());
     }
@@ -685,9 +683,22 @@ where
       return Err(());
     }
     open_file.open_refs -= 1;
-    // If inode is no longer referenced here, need to delete it
-    todo!();
-    return Ok(());
+    // If inode is no longer referenced here delete it
+    if open_file.open_refs == 0 {
+      let inode_num = open_file.inode as usize;
+      let mut inode = self.load_inode(inode_num)?;
+      if inode.refs > 0 {
+        return Ok(());
+      }
+      for d in inode.data_blocks.iter_mut() {
+        self.data_alloc_map.unset(*d as usize);
+        *d = 0;
+      }
+      self.save_inode(&inode, inode_num)?;
+      self.inode_alloc_map.unset(inode_num);
+      self.persist_allocs()?;
+    }
+    Ok(())
   }
   /// Saves the allocation maps to disk
   fn persist_allocs(&self) -> Result<(), ()> {
@@ -772,5 +783,49 @@ where
     }
     assert_eq!(read, dst.len());
     Ok(read)
+  }
+
+  // A bunch of convenience functions which are implemented in terms of the above functions
+
+  /// Convenience function for getting a directory from a file descriptor which is expected to
+  /// be a file.
+  pub fn as_directory(&mut self, fd: FileDescriptor) -> Result<Directory, ()> {
+    let mut buf = [0; core::mem::size_of::<Directory>()];
+    self.seek(fd, SeekFrom::Start(0))?;
+    self.read(fd, &mut buf)?;
+    Ok(unsafe { core::mem::transmute(buf) })
+  }
+
+  /// Function to convert an open file to a directory.
+  pub fn modify_kind(&mut self, fd: FileDescriptor, kind: INodeKind) -> Result<(), ()> {
+    let fdi = fd.0 as usize;
+    let fde = self.file_descs.get(fdi).ok_or(())?;
+    let mut inode = self.load_inode(fde.inode as usize)?;
+    match (inode.kind, kind) {
+      (a, b) =>
+        if a == b {
+          return Ok(());
+        },
+      /// Always fine
+      (_, INodeKind::File) => {},
+      (_, INodeKind::Directory) =>
+        if inode.size != core::mem::size_of::<Directory>() as u32 {
+          return Err(());
+        },
+    }
+    inode.kind = kind;
+    self.save_inode(&inode, fde.inode as usize);
+    Ok(())
+  }
+
+  /// Convenience function to make a directory inside of another directory
+  pub fn mkdir(&mut self, fd: FileDescriptor, name: &str) -> Result<FileDescriptor, ()> {
+    let new_fd = self.open(fd, &[name], FileMode::RW)?;
+    let fde = self.file_descs[fd.0 as usize];
+    let own_fde = self.file_descs[new_fd.0 as usize];
+    let new_dir = Directory::new(own_fde.inode, fde.inode);
+    self.write(new_fd, new_dir.ser())?;
+    self.modify_kind(new_fd, INodeKind::Directory)?;
+    Ok(new_fd)
   }
 }
