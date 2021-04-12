@@ -16,6 +16,7 @@
   associated_type_defaults,
   generic_associated_types,
   array_methods,
+  int_bits_const,
   pub_macro_rules
 )]
 #![allow(unused, incomplete_features)]
