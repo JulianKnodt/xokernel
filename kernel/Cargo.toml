@@ -28,10 +28,15 @@ run-command = [
   "qemu-system-x86_64",
   # the kernel itself
   "-drive", "format=raw,file={}",
+
   # additional drive for block device
   "-drive", "format=raw,if=none,file=disk,id=disk",
-  # An extra virt-io device?
+
   "-device", "virtio-blk,drive=disk",
+  #"virtio-blk-pci.disable-legacy=off",
+
   # use UART driver or own window
   #"-nographic",
+
+  #"-dtb",
 ]

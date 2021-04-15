@@ -23,9 +23,10 @@ macro_rules! bit_fn {
 macro_rules! bit_register {
   ($name: ident, $size: ty, [$( ($bit: expr, $fn_name: ident $(,$set_name: ident)? ) $(,)?)*]) => {
     #[repr(transparent)]
-    #[derive(Copy, Clone, PartialEq, Debug, Eq)]
+    #[derive(Copy, Clone, PartialEq, Debug, Eq, Default)]
     struct $name($size);
     impl $name {
+      pub const fn empty() -> Self { Self(0) }
       $( bit_fn!($bit, $fn_name $(, $set_name )?); )*
     }
   }
@@ -123,9 +124,121 @@ pub struct PCIHeader0 {
   interrupt_line: u8,
 }
 
-#[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-struct DeviceSpace([u8; 16384]);
+bit_register!(DescTableFlags, u16, [
+  (0, next),
+  (1, write_only),
+  (2, indirect),
+]);
+
+#[repr(align(16))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DescTable {
+  addr: u64,
+  len: u32,
+  flags: DescTableFlags,
+  next: u16,
+}
+
+impl DescTable {
+  const fn new() -> Self {
+    DescTable {
+      addr: 0,
+      len: 0,
+      flags: DescTableFlags::empty(),
+      next: 0,
+    }
+  }
+}
+
+bit_register!(VirtAvailFlags, u16, [(0, no_interrupt)]);
+
+#[repr(align(2))]
+#[derive(Debug)]
+pub struct AvailableRing<const QS: usize> {
+  flags: VirtAvailFlags,
+  idx: u16,
+  ring: [u16; QS],
+  used_event: u16,
+}
+
+impl<const QS: usize> AvailableRing<QS> {
+  const fn new() -> Self {
+    Self {
+      flags: VirtAvailFlags::empty(),
+      idx: 0,
+      ring: [0; QS],
+      used_event: 0,
+    }
+  }
+}
+
+bit_register!(VirtQUsedFlags, u16, [(0, no_interrupt),]);
+
+#[repr(align(4))]
+#[derive(Debug)]
+pub struct UsedRing<const QS: usize> {
+  flags: VirtQUsedFlags,
+  idx: u16,
+  used_elems: [UsedElem; QS],
+  avail_event: u16,
+}
+
+impl<const QS: usize> UsedRing<QS> {
+  const fn new() -> Self {
+    Self {
+      flags: VirtQUsedFlags::empty(),
+      idx: 0,
+      used_elems: [UsedElem { idx: 0, len: 0 }; QS],
+      avail_event: 0,
+    }
+  }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct UsedElem {
+  idx: u32,
+  len: u32,
+}
+
+const Q_ALIGN: usize = 4096;
+const fn q_align_padding<const QS: usize>() -> usize {
+  (QS * core::mem::size_of::<DescTable>() + core::mem::size_of::<AvailableRing<QS>>()) % Q_ALIGN
+}
+
+#[repr(C)]
+#[repr(align(4096))]
+#[derive(Debug)]
+struct VirtQueue<const QS: usize>
+where
+  [(); q_align_padding::<QS>()]: , {
+  descriptor_table: [DescTable; QS],
+  avail_ring: AvailableRing<QS>,
+  padding: [u8; q_align_padding::<QS>()],
+  used: UsedRing<QS>,
+}
+
+impl<const QS: usize> VirtQueue<QS>
+where
+  [(); q_align_padding::<QS>()]: ,
+{
+  const fn new() -> Self {
+    Self {
+      descriptor_table: [DescTable::new(); QS],
+      avail_ring: AvailableRing::new(),
+      padding: [0; q_align_padding::<QS>()],
+      used: UsedRing::new(),
+    }
+  }
+}
+
+fn virtqueue_size(queue_size: u16) -> u32 {
+  let align = |v| (v + Q_ALIGN) & (!Q_ALIGN);
+  let qs = queue_size as usize;
+  let u16s = core::mem::size_of::<u16>();
+  let out = align(core::mem::size_of::<DescTable>() * qs + u16s * (3 + qs))
+    + align(u16s * 3 + core::mem::size_of::<UsedElem>() * qs);
+  out as u32
+}
 
 macro_rules! read_into_buf {
   ($size: expr, $offset:expr, [ $( $per: ty $(,)?)* ]) => {{
@@ -153,7 +266,8 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   ]);
   let mut header: CommonHeader = unsafe { core::mem::transmute(buf) };
   assert_eq!(header.device_id, 0x1af4, "Not a PCI virtio device");
-  assert_eq!(header.vendor_id, 0x1001, "Not a block device");
+  assert_eq!(header.vendor_id, 0x1001, "Not a legacy block device");
+  // assert_eq!(header.vendor_id, 0x1042, "Not a modern block device");
   assert!(
     0x1000 < header.vendor_id && header.vendor_id < 0x107f,
     "Not a PCI virtio device"
@@ -189,10 +303,6 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   }
   let first_pci_cap: LegacyVirtioCommonCfg =
     unsafe { *(buf.as_ptr() as *const LegacyVirtioCommonCfg) };
-  #[repr(align(16384))]
-  struct Queue([u8;16384]);
-  static mut Q: Queue = Queue([0;16384]);
-  //write!(vga_buffer::Writer::new(16, 0), "{:x?}", first_pci_cap);
   unsafe {
     PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::Reset as u8);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -200,27 +310,42 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::Driver as u8);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    let v: u8 = PortRead::read_from_port(base_addr as u16 + 18);
-    write!(vga_buffer::Writer::new(6, 0), "{:x}", v);
+    // TODO write some features we want? Not sure which are wanted
   }
-  for i in 0..mem {
-    let v: u8 = unsafe { PortRead::read_from_port(base_addr as u16 + i as u16) };
-    buf[i as usize] = v;
-  }
-  let first_pci_cap: LegacyVirtioCommonCfg =
-    unsafe { *(buf.as_ptr() as *const LegacyVirtioCommonCfg) };
+
+  /*
+  Perform device-specific setup, including discovery of virtqueues for the device, optional
+  per-bus setup, reading and possibly writing the device’s virtio configuration space, and
+  population of virtqueues.
+  */
+  assert_eq!(
+    core::mem::size_of::<VirtQueue<256>>(),
+    8192,
+    "VirtQueue size changed",
+  );
+
+  static mut VIRT_QUEUE: VirtQueue<256> = VirtQueue::new();
+
+  assert_eq!(core::mem::align_of_val(unsafe { &VIRT_QUEUE }), 4096,);
+  assert_eq!(unsafe { &VIRT_QUEUE } as *const _ as usize % 4096, 0);
   write!(vga_buffer::Writer::new(7, 0), "{:x?}", first_pci_cap);
+
   unsafe {
-    PortWrite::write_to_port(base_addr as u16 + 8, Q.0.as_ptr() as u32/4096);
-    for i in 0..16384 {
-      let v = (Q.0.as_ptr() as *const u8).add(i).read_volatile();
-      if v != 0 {
-        write!(vga_buffer::Writer::new(15, 0), "Got something");
-      }
-      let v: u32 = PortRead::read_from_port(Q.0.as_ptr() as u16);
-      write!(vga_buffer::Writer::new(15, 0), "{:x}", v);
-    }
-  };
+    // Queue-select
+    PortWrite::write_to_port(base_addr as u16 + 14, 0u16);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let v: u16 = PortRead::read_from_port(base_addr as u16 + 12);
+
+    PortWrite::write_to_port(base_addr as u16 + 16, unsafe { &QUEUE_NOTIFY } as *const _ as u16);
+    assert_ne!(v, 0, "First VirtQueue does not exist");
+    assert_eq!(v, 256, "Lazy, did not want to configure memory allocations");
+  }
+
+  // Markdriver as ready to drive
+  unsafe {
+    PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::DriverOk as u8);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+  }
   return header0;
 }
 
@@ -244,6 +369,11 @@ pub struct LegacyVirtioCommonCfg {
   device_status: u8,
   // R
   isr_status: u8,
+}
+impl LegacyVirtioCommonCfg {
+  const QUEUE_SELECT_OFFSET: usize = 4 + 4 + 4 + 2;
+  const QUEUE_SIZE_OFFSET: usize = 4 + 4 + 4;
+  const DEVICE_STATUS_OFFSET: usize = 18;
 }
 
 #[repr(u8)]
