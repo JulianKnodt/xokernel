@@ -240,6 +240,37 @@ fn virtqueue_size(queue_size: u16) -> u32 {
   out as u32
 }
 
+#[derive(Debug)]
+#[repr(C)]
+struct VirtIOBlkCfg {
+  // capacity is number of 512 byte sectors
+  // note when using a file as a disk I need to manually make the file big to give it sectors.
+  capacity: u64,
+  size_max: u32,
+  seg_max: u32,
+  cylinders: u16,
+  heads: u8,
+  sectors: u8,
+  blk_size: u32,
+  // # of logical blocks per physical block (log2)
+  physical_block_exp: u8,
+  // offset of first aligned logical block
+  alignment_offset: u8,
+  // suggested minimum I/O size in blocks
+  min_io_size: u16,
+  // optimal (suggested maximum) I/O size in blocks
+  opt_io_size: u32,
+  writeback: u8,
+  _unused0: [u8;3],
+  max_discard_sectors: u32,
+  max_discard_seg: u32,
+  discard_sector_alignment: u32,
+  max_write_zeroes_sectors: u32,
+  max_write_zeroes_seg: u32,
+  write_zeroes_may_unmap: u8,
+  _unused1: [u8; 3],
+}
+
 macro_rules! read_into_buf {
   ($size: expr, $offset:expr, [ $( $per: ty $(,)?)* ]) => {{
     let mut buf = [0u8; $size];
@@ -303,6 +334,14 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   }
   let first_pci_cap: LegacyVirtioCommonCfg =
     unsafe { *(buf.as_ptr() as *const LegacyVirtioCommonCfg) };
+  let rest = &buf[core::mem::size_of::<LegacyVirtioCommonCfg>()..];
+  let virtio_blk_cfg: VirtIOBlkCfg = unsafe {
+    (rest.as_ptr() as *const VirtIOBlkCfg).read()
+  };
+  write!(vga_buffer::Writer::new(4, 0), "{:?}", &rest[..4]);
+  write!(vga_buffer::Writer::new(5, 0), "{:x?}", virtio_blk_cfg);
+
+  // Device specific configuration actually occurs after this LegacyVirtioCommonCfg
   unsafe {
     PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::Reset as u8);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -328,20 +367,28 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
 
   assert_eq!(core::mem::align_of_val(unsafe { &VIRT_QUEUE }), 4096,);
   assert_eq!(unsafe { &VIRT_QUEUE } as *const _ as usize % 4096, 0);
-  write!(vga_buffer::Writer::new(7, 0), "{:x?}", first_pci_cap);
+  //write!(vga_buffer::Writer::new(7, 0), "{:x?}", first_pci_cap);
 
   unsafe {
-    // Queue-select
+    // Queue-select <-- 0, := select 0th queue
     PortWrite::write_to_port(base_addr as u16 + 14, 0u16);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // Queue-size --> Get requested size for 0th queue
     let v: u16 = PortRead::read_from_port(base_addr as u16 + 12);
 
-    PortWrite::write_to_port(base_addr as u16 + 16, unsafe { &QUEUE_NOTIFY } as *const _ as u16);
     assert_ne!(v, 0, "First VirtQueue does not exist");
     assert_eq!(v, 256, "Lazy, did not want to configure memory allocations");
+    // Queue-address <-- VirtQueue Address divided by 4096 for legacy spec?
+    let vq_addr = (&VIRT_QUEUE as *const _ as u32) / 4096;
+    PortWrite::write_to_port(base_addr as u16 + 8, vq_addr);
+    // Queue-notify <-- 0th index = available buffers FIXME not sure if this is needed in init
+    PortWrite::write_to_port(base_addr as u16 + 16, 0u16);
   }
 
-  // Markdriver as ready to drive
+  //let vq = unsafe { core::ptr::read_volatile(&VIRT_QUEUE) };
+  //write!(vga_buffer::Writer::new(7, 0), "{:x?}", vq);
+
+  // Mark driver as ready to drive
   unsafe {
     PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::DriverOk as u8);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -349,9 +396,9 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   return header0;
 }
 
-/// Found in bar0
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// Found in bar0 on legacy virtio devices
 #[repr(C)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct LegacyVirtioCommonCfg {
   // R
   device_features: u32,
