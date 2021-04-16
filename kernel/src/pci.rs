@@ -57,6 +57,7 @@ bit_register!(Status, u16, [
 bit_register!(Command, u16, [
   (0, io_space, set_io_space),
   (1, mem_space, set_mem_space),
+  (10, interrupt_disable),
 ]);
 
 #[repr(C)]
@@ -240,37 +241,6 @@ fn virtqueue_size(queue_size: u16) -> u32 {
   out as u32
 }
 
-#[derive(Debug)]
-#[repr(C)]
-struct VirtIOBlkCfg {
-  // capacity is number of 512 byte sectors
-  // note when using a file as a disk I need to manually make the file big to give it sectors.
-  capacity: u64,
-  size_max: u32,
-  seg_max: u32,
-  cylinders: u16,
-  heads: u8,
-  sectors: u8,
-  blk_size: u32,
-  // # of logical blocks per physical block (log2)
-  physical_block_exp: u8,
-  // offset of first aligned logical block
-  alignment_offset: u8,
-  // suggested minimum I/O size in blocks
-  min_io_size: u16,
-  // optimal (suggested maximum) I/O size in blocks
-  opt_io_size: u32,
-  writeback: u8,
-  _unused0: [u8;3],
-  max_discard_sectors: u32,
-  max_discard_seg: u32,
-  discard_sector_alignment: u32,
-  max_write_zeroes_sectors: u32,
-  max_write_zeroes_seg: u32,
-  write_zeroes_may_unmap: u8,
-  _unused1: [u8; 3],
-}
-
 macro_rules! read_into_buf {
   ($size: expr, $offset:expr, [ $( $per: ty $(,)?)* ]) => {{
     let mut buf = [0u8; $size];
@@ -304,16 +274,16 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
     "Not a PCI virtio device"
   );
 
-  if header.header_type != 0 {
-    todo!();
-  }
+  assert_eq!(header.header_type, 0);
+  assert!(!header.command.interrupt_disable());
 
   let mut buf = read_into_buf!(core::mem::size_of::<PCIHeader0>(), 0x10, [
     u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32,
   ]);
   let header0: PCIHeader0 = unsafe { core::mem::transmute(buf) };
+  assert_eq!(header0.interrupt_pin, 0);
 
-  // ---- Finished reading in headers
+  // ---- Finished reading in headers, Start reading legacy configuration in
   let raw: u32 = unsafe {
     PortWrite::write_to_port(CONFIG_ADDRESS, cfg(0, 4, 0, 0x10));
     let og: u32 = PortRead::read_from_port(CONFIG_DATA);
@@ -328,20 +298,18 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   assert!(bar0.io_space());
   let mut buf = [0u8; 128];
   let base_addr = bar0.addr();
+
   for i in 0..mem {
     let v: u8 = unsafe { PortRead::read_from_port(base_addr as u16 + i as u16) };
     buf[i as usize] = v;
   }
-  let first_pci_cap: LegacyVirtioCommonCfg =
+
+  let legacy_cfg: LegacyVirtioCommonCfg =
     unsafe { *(buf.as_ptr() as *const LegacyVirtioCommonCfg) };
   let rest = &buf[core::mem::size_of::<LegacyVirtioCommonCfg>()..];
-  let virtio_blk_cfg: VirtIOBlkCfg = unsafe {
-    (rest.as_ptr() as *const VirtIOBlkCfg).read()
-  };
-  write!(vga_buffer::Writer::new(4, 0), "{:?}", &rest[..4]);
-  write!(vga_buffer::Writer::new(5, 0), "{:x?}", virtio_blk_cfg);
+  let virtio_blk_cfg: VirtioBlkCfg = unsafe { (rest.as_ptr() as *const VirtioBlkCfg).read() };
+  assert_ne!(virtio_blk_cfg.capacity, 0, "Found empty virtio blk cfg");
 
-  // Device specific configuration actually occurs after this LegacyVirtioCommonCfg
   unsafe {
     PortWrite::write_to_port(base_addr as u16 + 18, VirtioStatus::Reset as u8);
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -367,7 +335,7 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
 
   assert_eq!(core::mem::align_of_val(unsafe { &VIRT_QUEUE }), 4096,);
   assert_eq!(unsafe { &VIRT_QUEUE } as *const _ as usize % 4096, 0);
-  //write!(vga_buffer::Writer::new(7, 0), "{:x?}", first_pci_cap);
+  // write!(vga_buffer::Writer::new(7, 0), "{:x?}", legacy_cfg);
 
   unsafe {
     // Queue-select <-- 0, := select 0th queue
@@ -376,8 +344,11 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
     // Queue-size --> Get requested size for 0th queue
     let v: u16 = PortRead::read_from_port(base_addr as u16 + 12);
 
-    assert_ne!(v, 0, "First VirtQueue does not exist");
-    assert_eq!(v, 256, "Lazy, did not want to configure memory allocations");
+    assert_ne!(v, 0, "VirtQueue[0] does not exist");
+    assert_eq!(
+      v, 256,
+      "Did not want to configure memory allocations: incorrect size"
+    );
     // Queue-address <-- VirtQueue Address divided by 4096 for legacy spec?
     let vq_addr = (&VIRT_QUEUE as *const _ as u32) / 4096;
     PortWrite::write_to_port(base_addr as u16 + 8, vq_addr);
@@ -396,6 +367,15 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
   return header0;
 }
 
+bit_register!(LegacyDeviceStatus, u8, [
+  (0, ack, set_ack),
+  (1, driver, set_driver),
+  (2, driver_ok, set_driver_ok),
+  (3, features_ok, set_features_ok),
+  (6, device_needs_reset),
+  (7, failed, set_failed),
+]);
+
 /// Found in bar0 on legacy virtio devices
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -413,14 +393,68 @@ pub struct LegacyVirtioCommonCfg {
   // R+W
   queue_notify: u16,
   // R+W
-  device_status: u8,
+  device_status: LegacyDeviceStatus,
   // R
   isr_status: u8,
 }
-impl LegacyVirtioCommonCfg {
-  const QUEUE_SELECT_OFFSET: usize = 4 + 4 + 4 + 2;
-  const QUEUE_SIZE_OFFSET: usize = 4 + 4 + 4;
-  const DEVICE_STATUS_OFFSET: usize = 18;
+
+/// Is after the LegacyVirtio header
+#[derive(Debug)]
+#[repr(C)]
+struct VirtioBlkCfg {
+  // capacity is number of 512 byte sectors
+  // note when using a file as a disk I need to manually make the file big to give it sectors.
+  capacity: u64,
+  size_max: u32,
+  seg_max: u32,
+  cylinders: u16,
+  heads: u8,
+  sectors: u8,
+  blk_size: u32,
+  // # of logical blocks per physical block (log2)
+  physical_block_exp: u8,
+  // offset of first aligned logical block
+  alignment_offset: u8,
+  // suggested minimum I/O size in blocks
+  min_io_size: u16,
+  // optimal (suggested maximum) I/O size in blocks
+  opt_io_size: u32,
+  writeback: u8,
+  _unused0: [u8; 3],
+  max_discard_sectors: u32,
+  max_discard_seg: u32,
+  discard_sector_alignment: u32,
+  max_write_zeroes_sectors: u32,
+  max_write_zeroes_seg: u32,
+  write_zeroes_may_unmap: u8,
+  _unused1: [u8; 3],
+}
+
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum VirtioStatus {
+  Reset = 0,
+  Ack = 1,
+  Driver = 2,
+  Failed = 128,
+  FeaturesOk = 8,
+  DriverOk = 4,
+  DeviceNeedsReset = 64,
+}
+
+/*
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct VirtioPCICap {
+  cap_vndr: u8,     /* Generic PCI field: PCI_CAP_ID_VNDR */
+  cap_next: u8,     /* Generic PCI field: next ptr. */
+  cap_len: u8,      /* Generic PCI field: capability length */
+  cfg_type: u8,     //VirtioPCICapCfg, /* Identifies the structure. */
+  bar: u8,          /* Where to find it. */
+  padding: [u8; 3], /* Pad to full dword. */
+  // The fields below should be encoded in memory as little endian
+  offset: u32, /* Offset within bar. */
+  length: u32, /* Length of the structure, in bytes. */
 }
 
 #[repr(u8)]
@@ -437,29 +471,32 @@ enum VirtioPCICapCfg {
   /* PCI configuration access */
   PCI = 5,
 }
-
-#[repr(u8)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum VirtioStatus {
-  Reset = 0,
-  Ack = 1,
-  Driver = 2,
-  Failed = 128,
-  FeaturesOk = 8,
-  DriverOk = 4,
-  DeviceNeedsReset = 64,
-}
+*/
 
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct VirtioPCICap {
-  cap_vndr: u8,     /* Generic PCI field: PCI_CAP_ID_VNDR */
-  cap_next: u8,     /* Generic PCI field: next ptr. */
-  cap_len: u8,      /* Generic PCI field: capability length */
-  cfg_type: u8,     //VirtioPCICapCfg, /* Identifies the structure. */
-  bar: u8,          /* Where to find it. */
-  padding: [u8; 3], /* Pad to full dword. */
-  // The fields below should be encoded in memory as little endian
-  offset: u32, /* Offset within bar. */
-  length: u32, /* Length of the structure, in bytes. */
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtioBlkRequest<const N: usize> {
+  ty: VirtioBlkRequestType,
+  _reserved: u32,
+  sector: u64,
+  data: [[u8; 512]; N],
+  status: VirtioBlkStatus,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlkRequestType {
+  In = 0,
+  Out = 1,
+  Flush = 4,
+  Discard = 11,
+  Zero = 13,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlkStatus {
+  Ok = 0,
+  Err = 1,
+  Unsupported = 2,
 }
