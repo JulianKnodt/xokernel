@@ -8,6 +8,7 @@ macro_rules! bit_fn {
     pub(crate) fn $name(self) -> bool { ((self.0 >> $bit) & 0b1) == 1 }
     $(
       #[inline]
+      #[must_use]
       pub(crate) fn $set_name(self, v: bool)  -> Self {
         let mask = 1 << $bit;
         if v {
@@ -26,6 +27,7 @@ macro_rules! bit_register {
     #[derive(Copy, Clone, PartialEq, Debug, Eq, Default)]
     struct $name($size);
     impl $name {
+      #[inline]
       pub const fn empty() -> Self { Self(0) }
       $( bit_fn!($bit, $fn_name $(, $set_name )?); )*
     }
@@ -39,6 +41,7 @@ const CONFIG_DATA: u16 = 0x0cfc;
 const BASE: u32 = 0x80000000;
 
 // Offset here refers to the register of the thing we want
+#[inline]
 pub fn cfg(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
   BASE
     | ((bus as u32) << 16)
@@ -83,6 +86,7 @@ pub enum BarMemWidth {
   U64 = 2,
   Reserved = 1,
 }
+
 impl From<u32> for BarMemWidth {
   fn from(v: u32) -> Self {
     match v {
@@ -93,6 +97,7 @@ impl From<u32> for BarMemWidth {
     }
   }
 }
+
 impl BarMemWidth {
   fn u32(self) -> bool { Self::U32 == self }
 }
@@ -106,7 +111,7 @@ impl Bar {
   pub fn prefetchable(self) -> bool { ((self.0 & 0b1000) >> 3) == 1 }
   #[inline]
   pub fn kind(self) -> BarMemWidth { ((self.0 & 0b110) >> 1).into() }
-  pub fn mem_space(self) -> bool { (self.0 & 0b1) == 0 }
+  pub fn mem_space(self) -> bool { !self.io_space() }
 }
 
 #[repr(C)]
@@ -126,9 +131,9 @@ pub struct PCIHeader0 {
 }
 
 bit_register!(DescTableFlags, u16, [
-  (0, next),
-  (1, write_only),
-  (2, indirect),
+  (0, next, set_next),
+  (1, write_only, set_write_only),
+  (2, indirect, set_indirect),
 ]);
 
 #[repr(align(16))]
@@ -212,8 +217,8 @@ const fn q_align_padding<const QS: usize>() -> usize {
 struct VirtQueue<const QS: usize>
 where
   [(); q_align_padding::<QS>()]: , {
-  descriptor_table: [DescTable; QS],
-  avail_ring: AvailableRing<QS>,
+  descriptors: [DescTable; QS],
+  avail: AvailableRing<QS>,
   padding: [u8; q_align_padding::<QS>()],
   used: UsedRing<QS>,
 }
@@ -223,12 +228,94 @@ where
   [(); q_align_padding::<QS>()]: ,
 {
   const fn new() -> Self {
+    let mut descriptors = [DescTable::new(); QS];
+    let mut i = 0;
+    while i < QS {
+      descriptors[i].next = i as u16 + 1;
+      i += 1;
+    }
+
     Self {
-      descriptor_table: [DescTable::new(); QS],
-      avail_ring: AvailableRing::new(),
+      descriptors,
+      avail: AvailableRing::new(),
       padding: [0; q_align_padding::<QS>()],
       used: UsedRing::new(),
     }
+  }
+}
+
+#[derive(Debug)]
+struct VirtQueueMetadata<const QS: usize>
+where
+  [(); q_align_padding::<QS>()]: , {
+  vq: VirtQueue<QS>,
+  /// Pointer to beginning of free list in the virtqueue descriptor table.
+  free_ptr: u16,
+  /// Base addr of port at which this VirtQueue is.
+  base_addr: u16,
+}
+
+impl<const QS: usize> VirtQueueMetadata<QS>
+where
+  [(); q_align_padding::<QS>()]: ,
+{
+  const fn new() -> Self {
+    Self {
+      vq: VirtQueue::new(),
+      free_ptr: 0,
+      base_addr: 0,
+    }
+  }
+  fn alloc_descriptor(&mut self, addr: u64) -> Result<u16, ()> {
+    let desc = self.free_ptr;
+    if desc as usize == QS {
+      return Err(());
+    }
+    let entry = &mut self.vq.descriptors[desc as usize];
+    let next = entry.next;
+    self.free_ptr = next;
+    entry.addr = addr;
+    Ok(desc)
+  }
+  fn free_descriptor(&mut self, desc: u16) {
+    let entry = &mut self.vq.descriptors[desc as usize];
+    entry.next = self.free_ptr;
+    self.free_ptr = desc;
+  }
+  fn blk_cmd<const N: usize>(
+    &mut self,
+    ty: VirtioBlkRequestType,
+    sector: u64,
+    data: &[u8],
+  ) -> Result<(), ()> {
+    // TODO need to allocate this somewhere long-lived
+    let req: VirtioBlkRequest<0> = VirtioBlkRequest::new(ty, sector);
+    let req_desc = self.alloc_descriptor((&req) as *const _ as u64)?;
+    let req_entry = &mut self.vq.descriptors[req_desc as usize];
+    req_entry.len = 16;
+    req_entry.flags = req_entry.flags.set_next(true);
+
+    let data_desc = self.alloc_descriptor(data.as_ptr() as u64)?;
+    let data_entry = &mut self.vq.descriptors[data_desc as usize];
+    data_entry.len = 512;
+    data_entry.flags = data_entry.flags.set_next(true).set_write_only(true);
+
+    let status_desc = self.alloc_descriptor((&req.status as *const _) as u64)?;
+    let status_entry = &mut self.vq.descriptors[status_desc as usize];
+    status_entry.len = 1;
+    status_entry.flags = status_entry.flags.set_write_only(true);
+
+    self.vq.descriptors[req_desc as usize].next = data_desc;
+    self.vq.descriptors[data_desc as usize].next = status_desc;
+
+    self.vq.avail.ring[self.vq.avail.idx as usize] = data_desc;
+    self.vq.avail.idx += 1;
+
+    unsafe {
+      PortWrite::write_to_port(self.base_addr + 16, 0u16);
+    }
+
+    Ok(())
   }
 }
 
@@ -259,6 +346,8 @@ macro_rules! read_into_buf {
     buf
   }}
 }
+
+static mut VIRT_QUEUE: VirtQueueMetadata<256> = VirtQueueMetadata::new();
 
 /// Initializes the block device on PCI
 pub fn init_block_device_on_pci() -> PCIHeader0 {
@@ -331,8 +420,6 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
     "VirtQueue size changed",
   );
 
-  static mut VIRT_QUEUE: VirtQueue<256> = VirtQueue::new();
-
   assert_eq!(core::mem::align_of_val(unsafe { &VIRT_QUEUE }), 4096,);
   assert_eq!(unsafe { &VIRT_QUEUE } as *const _ as usize % 4096, 0);
   // write!(vga_buffer::Writer::new(7, 0), "{:x?}", legacy_cfg);
@@ -350,14 +437,17 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
       "Did not want to configure memory allocations: incorrect size"
     );
     // Queue-address <-- VirtQueue Address divided by 4096 for legacy spec?
-    let vq_addr = (&VIRT_QUEUE as *const _ as u32) / 4096;
+    let vq_addr = (&VIRT_QUEUE.vq as *const _ as u32) / 4096;
     PortWrite::write_to_port(base_addr as u16 + 8, vq_addr);
+    assert_eq!(vq_addr, PortRead::read_from_port(base_addr as u16 + 8));
+
     // Queue-notify <-- 0th index = available buffers FIXME not sure if this is needed in init
     PortWrite::write_to_port(base_addr as u16 + 16, 0u16);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
   }
 
-  //let vq = unsafe { core::ptr::read_volatile(&VIRT_QUEUE) };
-  //write!(vga_buffer::Writer::new(7, 0), "{:x?}", vq);
+  let vq = unsafe { core::ptr::read_volatile(&VIRT_QUEUE) };
+  write!(vga_buffer::Writer::new(7, 0), "{:x?}", vq);
 
   // Mark driver as ready to drive
   unsafe {
@@ -365,6 +455,11 @@ pub fn init_block_device_on_pci() -> PCIHeader0 {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
   }
   return header0;
+}
+
+fn virtio_blk_isr(interrupt_id: u32) {
+  // TODO get block device
+  // Acknowledge interrupt
 }
 
 bit_register!(LegacyDeviceStatus, u8, [
@@ -442,37 +537,6 @@ enum VirtioStatus {
   DeviceNeedsReset = 64,
 }
 
-/*
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct VirtioPCICap {
-  cap_vndr: u8,     /* Generic PCI field: PCI_CAP_ID_VNDR */
-  cap_next: u8,     /* Generic PCI field: next ptr. */
-  cap_len: u8,      /* Generic PCI field: capability length */
-  cfg_type: u8,     //VirtioPCICapCfg, /* Identifies the structure. */
-  bar: u8,          /* Where to find it. */
-  padding: [u8; 3], /* Pad to full dword. */
-  // The fields below should be encoded in memory as little endian
-  offset: u32, /* Offset within bar. */
-  length: u32, /* Length of the structure, in bytes. */
-}
-
-#[repr(u8)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum VirtioPCICapCfg {
-  /* Common configuration */
-  CommonCfg = 1,
-  /* Notifications */
-  NotifyCfg = 2,
-  /* ISR Status */
-  ISR = 3,
-  /* Device specific configuration */
-  Device = 4,
-  /* PCI configuration access */
-  PCI = 5,
-}
-*/
-
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VirtioBlkRequest<const N: usize> {
@@ -481,6 +545,18 @@ struct VirtioBlkRequest<const N: usize> {
   sector: u64,
   data: [[u8; 512]; N],
   status: VirtioBlkStatus,
+}
+
+impl<const N: usize> VirtioBlkRequest<N> {
+  fn new(ty: VirtioBlkRequestType, sector: u64) -> Self {
+    Self {
+      ty,
+      _reserved: 0x3d,
+      sector,
+      data: [[0; 512]; N],
+      status: VirtioBlkStatus::Ok,
+    }
+  }
 }
 
 #[repr(u32)]
