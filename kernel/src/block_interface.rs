@@ -1,12 +1,5 @@
 use crate::bit_array::{nearest_div_8, BitArray};
 
-/*
-#[cfg(not(target_os = "macos"))]
-use alloc::prelude::v1::Box;
-*/
-
-use core::any::Any;
-
 pub trait BlockDevice {
   const NUM_BLOCKS: usize;
   const BLOCK_SIZE: usize;
@@ -206,7 +199,7 @@ impl Owner {
       0 => Self::Ours,
       1 => Self::LibFS,
       255 => Self::NoOwner,
-      v => panic!("Unknown owner byte {:?}", b),
+      v => panic!("Unknown owner byte {:?}", v),
     }
   }
 }

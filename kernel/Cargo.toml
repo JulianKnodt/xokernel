@@ -32,8 +32,9 @@ run-command = [
   # additional drive for block device
   "-drive", "format=raw,if=none,file=disk,id=disk",
 
-  "-device", "virtio-blk,drive=disk",
-  #"virtio-blk-pci.disable-legacy=off",
+  "-device",
+  "virtio-blk-pci,drive=disk,num-queues=1,disable-legacy=on,disable-modern=off",
+  #"-device", "virtio-blk,drive=disk,num-queues=1,disable-legacy=off",
 
   # use UART driver or own window
   #"-nographic",

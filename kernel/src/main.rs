@@ -17,6 +17,7 @@
   generic_associated_types,
   array_methods,
   int_bits_const,
+  test,
   pub_macro_rules
 )]
 #![allow(unused, incomplete_features)]
@@ -76,17 +77,6 @@ pub extern "C" fn _start(b_info: &'static BootInfo) -> ! {
   allocator::init_heap();
   vga_buffer::print_at(b"Finished Heap Init", 2, 0);
 
-  /*
-  let start = b_info
-    .memory_map
-    .iter()
-    .find(|&&mr| mr.region_type == MemoryRegionType::Kernel)
-    .unwrap()
-    .range
-    .start_addr();
-  let v = unsafe { *((start + 0x0250) as *const u64) };
-  write!(vga_buffer::Writer::new(4, 0), "SetupDataType {}", v);
-  */
   pci::init_block_device_on_pci();
 
   /*

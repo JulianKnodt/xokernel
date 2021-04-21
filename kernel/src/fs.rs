@@ -61,6 +61,7 @@ impl Directory {
       name_to_inode_map: [([0; 48], 0); NUM_ENTRIES],
     }
   }
+  /*
   /// Returns all the byte array entries of this directory
   #[inline]
   pub(crate) fn entries(&self) -> impl Iterator<Item = (&[u8], u32)> {
@@ -74,6 +75,7 @@ impl Directory {
           .map(|(name, inode)| (&name[..name[47] as usize], *inode)),
       )
   }
+  */
   /// Inserts an entry into this directory
   // TODO convert this into a result type
   pub fn insert(&mut self, name: &str, to: u32) -> Result<(), ()> {
@@ -125,7 +127,7 @@ impl Directory {
         .name_to_inode_map
         .iter()
         .take(self.num_added as usize)
-        .any(|(fname, inode)| fname[..fname[47] as usize].eq(bytes))
+        .any(|(fname, _inode)| fname[..fname[47] as usize].eq(bytes))
   }
   /// Removes an entry from this directory
   pub fn remove(&mut self, entry_num: usize) {
@@ -143,7 +145,7 @@ impl Directory {
       .name_to_inode_map
       .iter()
       .take(self.num_added as usize)
-      .position(|(fname, inode)| fname[..fname[47] as usize].eq(bytes))
+      .position(|(fname, _inode)| fname[..fname[47] as usize].eq(bytes))
   }
   default_ser_impl!();
 }
@@ -184,7 +186,6 @@ impl INode {
   }
   fn to_slice(&self, dst: &mut [u8]) {
     assert_eq!(dst.len(), core::mem::size_of::<Self>());
-    let mut data_blocks = [0u16; 8];
     dst[..2].copy_from_slice(&self.refs.to_ne_bytes());
     dst[2] = self.kind as u8;
     dst[3..7].copy_from_slice(&self.size.to_ne_bytes());
@@ -247,7 +248,7 @@ impl Metadata for Superblock {
     })
   }
   fn remove(&self, b: u32) -> Result<Self, ()> {
-    if self.owned.is_none() {
+    if self.owned != Some([b]) {
       return Err(());
     }
     Ok(Self {
@@ -289,7 +290,7 @@ impl Metadata for RangeMetadata {
     Err(())
   }
 
-  fn remove(&self, b: u32) -> Result<Self, ()> {
+  fn remove(&self, _b: u32) -> Result<Self, ()> {
     todo!();
   }
 
@@ -333,7 +334,7 @@ where
       // File system previously existed, reinitialize
       let mut mhs = gbi
         .metadatas_for(Owner::LibFS)
-        .filter(|(mh, amd)| matches!(amd, AllMetadata::RangeMetadata(_)))
+        .filter(|(_, amd)| matches!(amd, AllMetadata::RangeMetadata(_)))
         .map(|v| v.0);
       let inode_mh = mhs.next().expect("Got inode metadata handle");
       let data_mh = mhs.next().expect("Got inode metadata handle");
@@ -381,7 +382,9 @@ where
         .req_block(data_mh, i)
         .expect("Failed to add block to data");
     }
-    gbi.persist();
+    gbi
+      .persist()
+      .expect("Failed to persist global block interface");
     let mut out = Self {
       superblock: sb_mh,
       inode_md: inode_mh,
@@ -398,8 +401,10 @@ where
       .expect("Failed to allocate inode for root directory");
     assert_eq!(root_dir_inode_num, 0, "Unexpected inode 0 for root dir");
     let root_dir = Directory::new(0, 0);
-    /// Writes the root dir to the first inode
-    out.write_to_inode(&mut root_dir_inode, root_dir.ser(), 0);
+    // Writes the root dir to the first inode
+    out
+      .write_to_inode(&mut root_dir_inode, root_dir.ser(), 0)
+      .expect("Failed to write root dir to inode");
     out
       .save_inode(&root_dir_inode, root_dir_inode_num as usize)
       .expect("Failed to save root dir inode");
@@ -479,12 +484,12 @@ where
   pub fn stat(&self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, ()> {
     let fdi = fdi as usize;
     let fd = self.file_descs.get(fdi).ok_or(())?;
-    let mut inode = self.load_inode(fd.inode as usize)?;
+    let inode = self.load_inode(fd.inode as usize)?;
     Ok(FileStat { size: inode.size })
   }
   #[inline]
   const fn num_inode_blocks() -> usize {
-    let mut num_blocks_for_inodes = (NUM_INODE * core::mem::size_of::<INode>() / B::BLOCK_SIZE);
+    let mut num_blocks_for_inodes = NUM_INODE * core::mem::size_of::<INode>() / B::BLOCK_SIZE;
     if NUM_INODE * core::mem::size_of::<INode>() % B::BLOCK_SIZE != 0 {
       num_blocks_for_inodes += 1;
     }
@@ -494,8 +499,8 @@ where
   const fn inode_block_and_offset_and_wraps(i: usize) -> (usize, usize, bool) {
     // Should round down
     let bl = (i * core::mem::size_of::<INode>()) / B::BLOCK_SIZE;
-    let next_bl = (((i + 1) * core::mem::size_of::<INode>()) / B::BLOCK_SIZE);
-    let wraps = (bl != next_bl);
+    let next_bl = ((i + 1) * core::mem::size_of::<INode>()) / B::BLOCK_SIZE;
+    let wraps = bl != next_bl;
     let offset = (i * core::mem::size_of::<INode>()) % B::BLOCK_SIZE;
     (bl, offset, wraps)
   }
@@ -562,6 +567,7 @@ where
     self.persist_allocs()?;
     Ok(inode_num)
   }
+  /*
   /// Frees an inode from the inode alloc map
   fn free_inode(&mut self, i: usize) -> Result<(), ()> {
     assert!(
@@ -573,6 +579,7 @@ where
     self.persist_allocs()?;
     Ok(())
   }
+  */
   /// Opens a given path relative to dir.
   pub fn open(
     &mut self,
@@ -603,7 +610,7 @@ where
       }
       let mut buf: [u8; core::mem::size_of::<Directory>()] =
         unsafe { core::mem::transmute(curr_dir) };
-      self.read_from_inode(&curr_dir_inode, &mut buf, 0);
+      self.read_from_inode(&curr_dir_inode, &mut buf, 0)?;
       curr_dir = unsafe { core::mem::transmute(buf) };
     }
     let last_entry = path.last().unwrap();
@@ -615,8 +622,7 @@ where
       curr_dir
         .insert(last_entry, inode_num)
         .expect("Failed to insert name into directory");
-      let mut buf: [u8; core::mem::size_of::<Directory>()] =
-        unsafe { core::mem::transmute(curr_dir) };
+      let buf: [u8; core::mem::size_of::<Directory>()] = unsafe { core::mem::transmute(curr_dir) };
       self.write_to_inode(&mut curr_dir_inode, &buf, 0)?;
       self.save_inode(&curr_dir_inode, curr_dir_inode_num as usize)?;
       inode_num
@@ -656,7 +662,7 @@ where
       curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
       let mut buf: [u8; core::mem::size_of::<Directory>()] =
         unsafe { core::mem::transmute(curr_dir) };
-      self.read_from_inode(&curr_dir_inode, &mut buf, 0);
+      self.read_from_inode(&curr_dir_inode, &mut buf, 0)?;
       curr_dir = unsafe { core::mem::transmute(buf) };
     }
     let last_entry = path.last().unwrap();
@@ -668,10 +674,9 @@ where
       return Err(());
     }
     inode.refs -= 1;
-    self.save_inode(&inode, inode_num as usize);
+    self.save_inode(&inode, inode_num as usize)?;
     curr_dir.remove(curr_dir.index_of(last_entry).unwrap());
-    let mut buf: [u8; core::mem::size_of::<Directory>()] =
-      unsafe { core::mem::transmute(curr_dir) };
+    let buf: [u8; core::mem::size_of::<Directory>()] = unsafe { core::mem::transmute(curr_dir) };
     self.write_to_inode(&mut curr_dir_inode, &buf, 0)?;
     self.save_inode(&curr_dir_inode, curr_dir_inode_num as usize)?;
     Ok(())
@@ -722,7 +727,7 @@ where
   /// Writes a byte array to an inode
   fn write_to_inode(&mut self, inode: &mut INode, data: &[u8], offset: u32) -> Result<usize, ()> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
-    let end_byte = (offset + data.len() as u32);
+    let end_byte = offset + data.len() as u32;
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
     if end_block > 8 {
       // Not enough space in these files to write that much.
@@ -759,7 +764,7 @@ where
   /// Writes a byte array to an inode
   fn read_from_inode(&mut self, inode: &INode, dst: &mut [u8], offset: u32) -> Result<usize, ()> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
-    let end_byte = (offset + dst.len() as u32);
+    let end_byte = offset + dst.len() as u32;
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
     if end_block > 8 {
       // Reading past the end of the file
@@ -802,11 +807,8 @@ where
     let fde = self.file_descs.get(fdi).ok_or(())?;
     let mut inode = self.load_inode(fde.inode as usize)?;
     match (inode.kind, kind) {
-      (a, b) =>
-        if a == b {
-          return Ok(());
-        },
-      /// Always fine
+      (a, b) if a == b => return Ok(()),
+      // Always fine
       (_, INodeKind::File) => {},
       (_, INodeKind::Directory) =>
         if inode.size != core::mem::size_of::<Directory>() as u32 {
@@ -814,7 +816,7 @@ where
         },
     }
     inode.kind = kind;
-    self.save_inode(&inode, fde.inode as usize);
+    self.save_inode(&inode, fde.inode as usize)?;
     Ok(())
   }
 
