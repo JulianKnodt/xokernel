@@ -15,6 +15,9 @@
   pub_macro_rules,
   generic_associated_types,
   array_methods,
+  specialization,
+  int_bits_const,
+  test,
   with_options
 )]
 #![allow(unused, incomplete_features)]
@@ -79,4 +82,24 @@ fn bit_array_basic() {
   }
   assert!(b.find_free().is_some());
   assert_eq!(b.num_free(), 4096);
+}
+
+#[test]
+fn bit_array_contiguous() {
+  use bit_array::BitArray;
+  let mut b = BitArray::<4096>::new(false);
+  assert_eq!(b.find_free_contiguous(4096), Some(0));
+  for i in (0..4096).step_by(2) {
+    b.set(i);
+    assert!(b.get(i));
+  }
+  let contig = b.find_free_contiguous(2);
+  assert_eq!(contig, None, "{} {}", b.get(contig.unwrap()), b.get(contig.unwrap()+1));
+  assert!(b.get(100));
+  b.unset(100);
+  assert_eq!(b.find_free_contiguous(2), Some(99));
+  assert!(b.find_free_contiguous(3).is_some(), "{} {} {}", b.get(99), b.get(100), b.get(101));
+  assert!(b.get(102));
+  b.unset(102);
+  assert_eq!(b.find_free_contiguous(5), Some(99));
 }

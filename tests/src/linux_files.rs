@@ -1,4 +1,4 @@
-use crate::block_interface::BlockDevice;
+use crate::block_interface::{BlockDevice, Zeroable};
 use std::{
   fs::{remove_file, File},
   io::{Read, Seek, SeekFrom, Write},
@@ -26,7 +26,7 @@ impl Driver {
 impl BlockDevice for Driver {
   const NUM_BLOCKS: usize = 4096;
   const BLOCK_SIZE: usize = 512;
-  fn read(&self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()> {
+  fn read(&mut self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()> {
     let f = self.backing.as_ref().unwrap();
     let mut f = f.lock().expect("Failed to lock file for reading");
     f.seek(SeekFrom::Start(block_num as u64 * Self::BLOCK_SIZE as u64))
@@ -34,7 +34,7 @@ impl BlockDevice for Driver {
     let len = dst.len().min(Self::BLOCK_SIZE);
     f.read(&mut dst[..len]).map_err(|_| ())
   }
-  fn write(&self, block_num: u32, dst: &[u8]) -> Result<usize, ()> {
+  fn write(&mut self, block_num: u32, dst: &[u8]) -> Result<usize, ()> {
     let f = self.backing.as_ref().unwrap();
     let mut f = f.lock().expect("Failed to lock file for writing");
     f.seek(SeekFrom::Start(block_num as u64 * Self::BLOCK_SIZE as u64))
@@ -42,6 +42,7 @@ impl BlockDevice for Driver {
     f.write(dst).map_err(|_| ())
   }
   fn init(&mut self) {
+    remove_file(self.file_name);
     let backing = File::with_options()
       .read(true)
       .write(true)

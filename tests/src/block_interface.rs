@@ -4,11 +4,25 @@ pub trait BlockDevice {
   const NUM_BLOCKS: usize;
   const BLOCK_SIZE: usize;
   /// Read from a block on this device into dst. Returns number of bytes read.
-  fn read(&self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()>;
+  fn read(&mut self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()>;
   /// Write to a block on this device from src. Returns number of bytes written.
-  fn write(&self, block_num: u32, src: &[u8]) -> Result<usize, ()>;
+  fn write(&mut self, block_num: u32, src: &[u8]) -> Result<usize, ()>;
   /// Perform initialization of this block device
   fn init(&mut self) {}
+}
+
+pub trait Zeroable: BlockDevice {
+  fn zero(&mut self, block_num: u32) -> Result<usize, ()>;
+}
+
+default impl<T> Zeroable for T
+where
+  T: BlockDevice,
+  [(); T::BLOCK_SIZE]: ,
+{
+  fn zero(&mut self, block_num: u32) -> Result<usize, ()> {
+    self.write(block_num, &[0; Self::BLOCK_SIZE])
+  }
 }
 
 #[macro_export]
@@ -286,7 +300,10 @@ where
     for i in 0..OWN_BLOCKS {
       let read = self
         .block_device
-        .read(i as u32, &mut buf[i * B::BLOCK_SIZE..])
+        .read(
+          i as u32,
+          &mut buf[i * B::BLOCK_SIZE..(i + 1) * B::BLOCK_SIZE],
+        )
         .map_err(|_| InitErr::FailedToRead)?;
       assert_eq!(read, B::BLOCK_SIZE);
     }
@@ -324,7 +341,7 @@ where
     Ok(())
   }
 
-  pub fn persist(&self) -> Result<(), PersistErr> {
+  pub fn persist(&mut self) -> Result<(), PersistErr> {
     let mut buf = [0; OWN_BLOCKS * B::BLOCK_SIZE];
     // --- write magic number
     buf[..4].copy_from_slice(&u32::to_ne_bytes(MAGIC_NUMBER));
@@ -483,7 +500,7 @@ where
 
   /// Reads from `n`th block of the metadata handle into dst
   pub fn read(
-    &self,
+    &mut self,
     MetadataHandle(i): MetadataHandle,
     n: usize,
     dst: &mut [u8],
@@ -498,7 +515,7 @@ where
 
   /// Writes to the `n`th block of the metadata handle from src
   pub fn write(
-    &self,
+    &mut self,
     MetadataHandle(i): MetadataHandle,
     n: usize,
     src: &[u8],
