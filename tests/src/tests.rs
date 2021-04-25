@@ -135,10 +135,9 @@ fs_test!(nested_directories, |gfs| {
   assert_eq!(dir2.num_added, 1);
 });
 
-
 extern crate test;
-use test::bench::Bencher;
 use std::hint::black_box;
+use test::bench::Bencher;
 macro_rules! fs_bench {
   ($bench_name: ident, |$fs_name: ident, $b: ident| $contents: block) => {
     #[bench]
@@ -161,9 +160,13 @@ fs_bench!(bench_seek, |gfs, b| {
   let root_dir_fd = gfs
     .root_dir(fs::FileMode::W)
     .expect("failed to open root dir");
-  let fd = gfs.open(root_dir_fd, &["empty.txt"], fs::FileMode::RW).expect("Failed to open");
+  let fd = gfs
+    .open(root_dir_fd, &["empty.txt"], fs::FileMode::RW)
+    .expect("Failed to open");
   b.iter(|| {
-    gfs.seek(black_box(fd), black_box(fs::SeekFrom::Start(0))).expect("Failed to seek");
+    gfs
+      .seek(black_box(fd), black_box(fs::SeekFrom::Start(0)))
+      .expect("Failed to seek");
   });
 });
 
@@ -171,32 +174,41 @@ fs_bench!(bench_write_seek, |gfs, b| {
   let root_dir_fd = gfs
     .root_dir(fs::FileMode::W)
     .expect("failed to open root dir");
-  let fd = gfs.open(root_dir_fd, &["empty.txt"], fs::FileMode::RW).expect("Failed to open");
+  let fd = gfs
+    .open(root_dir_fd, &["empty.txt"], fs::FileMode::RW)
+    .expect("Failed to open");
   let data = [8; 512];
   b.iter(|| {
     gfs.write(fd, &data).expect("Failed to write");
-    gfs.seek(fd, fs::SeekFrom::Start(0)).expect("Failed to seek");
+    gfs
+      .seek(fd, fs::SeekFrom::Start(0))
+      .expect("Failed to seek");
   });
 });
 
-use std::fs::File;
-use std::io::{self, Write, Seek};
+use std::{
+  fs::File,
+  io::{self, Seek, Write},
+};
 #[bench]
 fn bench_linux_seek(b: &mut Bencher) {
-  let mut f = File::create("linux_empty.txt").expect("Failed to open");
+  let file_name = "linux_empty.txt";
+  let mut f = File::create(file_name).expect("Failed to open");
   let data = [8; 512];
   b.iter(|| {
     f.seek(io::SeekFrom::Start(0)).expect("Failed to seek");
   });
+  std::fs::remove_file(file_name);
 }
 
 #[bench]
 fn bench_linux_write_seek(b: &mut Bencher) {
-  let mut f = File::create("linux_empty.txt").expect("Failed to open");
+  let file_name = "linux_empty.txt";
+  let mut f = File::create(file_name).expect("Failed to open");
   let data = black_box([8; 512]);
   b.iter(|| {
     f.write(&data).expect("Failed to write");
     f.seek(io::SeekFrom::Start(0)).expect("Failed to seek");
   });
+  std::fs::remove_file(file_name);
 }
-

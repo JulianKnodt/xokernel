@@ -8,8 +8,10 @@
   const_fn_transmute,
   maybe_uninit_uninit_array,
   maybe_uninit_extra,
+  maybe_uninit_slice,
   default_alloc_error_handler,
   const_generics,
+  const_generics_defaults,
   const_evaluatable_checked,
   associated_type_defaults,
   pub_macro_rules,
@@ -22,7 +24,9 @@
 )]
 #![allow(unused, incomplete_features)]
 
+pub mod array_vec;
 pub mod bit_array;
+
 pub mod block_interface;
 pub mod fs;
 pub mod linux_files;
@@ -94,11 +98,23 @@ fn bit_array_contiguous() {
     assert!(b.get(i));
   }
   let contig = b.find_free_contiguous(2);
-  assert_eq!(contig, None, "{} {}", b.get(contig.unwrap()), b.get(contig.unwrap()+1));
+  assert_eq!(
+    contig,
+    None,
+    "{} {}",
+    b.get(contig.unwrap()),
+    b.get(contig.unwrap() + 1)
+  );
   assert!(b.get(100));
   b.unset(100);
   assert_eq!(b.find_free_contiguous(2), Some(99));
-  assert!(b.find_free_contiguous(3).is_some(), "{} {} {}", b.get(99), b.get(100), b.get(101));
+  assert!(
+    b.find_free_contiguous(3).is_some(),
+    "{} {} {}",
+    b.get(99),
+    b.get(100),
+    b.get(101)
+  );
   assert!(b.get(102));
   b.unset(102);
   assert_eq!(b.find_free_contiguous(5), Some(99));
