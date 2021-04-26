@@ -189,8 +189,8 @@ pub struct INode {
   refs: u16,
   kind: INodeKind,
   size: u32,
-  // (start, end) for ranges of data blocks
-  data_block_ranges: [u16; 8],
+  // (start, len) for ranges of data blocks
+  data_blocks: [u16; 8],
 }
 
 impl INode {
@@ -1003,13 +1003,7 @@ where
       return Err(RmdirErr::NotEmpty);
     }
 
-    self.unlink_from_dir(
-      fd,
-      curr_dir_inode_num,
-      curr_dir_inode,
-      curr_dir,
-      last_entry,
-    )?;
+    self.unlink_from_dir(fd, curr_dir_inode_num, curr_dir_inode, curr_dir, last_entry)?;
     Ok(())
   }
 
