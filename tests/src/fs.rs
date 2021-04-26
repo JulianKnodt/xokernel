@@ -189,8 +189,8 @@ pub struct INode {
   refs: u16,
   kind: INodeKind,
   size: u32,
-  // TODO think of a way to extend the size of data blocks here
-  data_blocks: [u16; 8],
+  // (start, end) for ranges of data blocks
+  data_block_ranges: [u16; 8],
 }
 
 impl INode {
@@ -238,7 +238,6 @@ impl INode {
 pub enum INodeKind {
   File = 0,
   Directory = 1,
-  Contiguous = 2,
 }
 
 impl From<u8> for INodeKind {
@@ -246,7 +245,6 @@ impl From<u8> for INodeKind {
     match v {
       0 => INodeKind::File,
       1 => INodeKind::Directory,
-      2 => INodeKind::Contiguous,
       v => panic!("Unknown INodeKind {}", v),
     }
   }
@@ -459,13 +457,13 @@ where
     out
   }
   /// Opens a file to the root directory of the file system.
-  pub fn root_dir(&mut self, mode: FileMode) -> Result<FileDescriptor, ()> {
+  pub fn root_dir(&mut self, mode: FileMode) -> Result<FileDescriptor, OpenErr> {
     let (i, fd) = self
       .file_descs
       .iter_mut()
       .enumerate()
       .find(|(_, fd)| fd.open_refs == 0)
-      .ok_or(())?;
+      .ok_or(OpenErr::NoFreeFDs)?;
     fd.inode = 0;
     fd.open_refs += 1;
     fd.offset = 0;
@@ -975,7 +973,6 @@ where
       (a, b) if a == b => return Ok(()),
       // Always fine
       (_, INodeKind::File) => {},
-      (_, INodeKind::Contiguous) => todo!(),
       (_, INodeKind::Directory) =>
         if inode.size != core::mem::size_of::<Directory>() as u32 {
           return Err(ModifyKindErr::DirSizeMismatch);
@@ -988,6 +985,11 @@ where
 
   /// Removes a directory from a given reference path with the given name
   pub fn rmdir(&mut self, fd: FileDescriptor, path: &[&str]) -> Result<(), RmdirErr> {
+    let last_entry = match path.last() {
+      None => return Err(RmdirErr::OpenErr(OpenErr::MustProvideFileName)),
+      Some(&"." | &"..") => return Err(RmdirErr::CannotRmdirSelfOrParent),
+      Some(v) => v,
+    };
     let (fd, (curr_dir_inode_num, curr_dir_inode, curr_dir)) =
       self.open_with_dir(fd, path, FileMode::MustExist)?;
     if !self.is_directory(fd)? {
@@ -1006,7 +1008,7 @@ where
       curr_dir_inode_num,
       curr_dir_inode,
       curr_dir,
-      path.last().unwrap(),
+      last_entry,
     )?;
     Ok(())
   }
@@ -1124,7 +1126,8 @@ define_error!(MkdirErr: [] OpenErr(OpenErr), WriteErr(WriteErr), ModifyKindErr(M
 define_error!(
   RmdirErr:
   NotDirectory,
-  NotEmpty
+  NotEmpty,
+  CannotRmdirSelfOrParent
   []
   OpenErr(OpenErr),
   WriteErr(WriteErr),
