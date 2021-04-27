@@ -12,7 +12,7 @@ macro_rules! fs_test {
       };
       $contents($fs_name);
       unsafe {
-        GBI.block_device.clean();
+        GBI.block_device_mut().clean();
       }
     }
   };
@@ -150,7 +150,7 @@ macro_rules! fs_bench {
       };
       $contents($fs_name, $b);
       unsafe {
-        GBI.block_device.clean();
+        GBI.block_device_mut().clean();
       }
     }
   };

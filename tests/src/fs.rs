@@ -189,7 +189,6 @@ pub struct INode {
   refs: u16,
   kind: INodeKind,
   size: u32,
-  // (start, len) for ranges of data blocks
   data_blocks: [u16; 8],
 }
 
@@ -238,6 +237,7 @@ impl INode {
 pub enum INodeKind {
   File = 0,
   Directory = 1,
+  Contiguous = 2,
 }
 
 impl From<u8> for INodeKind {
@@ -245,6 +245,7 @@ impl From<u8> for INodeKind {
     match v {
       0 => INodeKind::File,
       1 => INodeKind::Directory,
+      2 => INodeKind::Contiguous,
       v => panic!("Unknown INodeKind {}", v),
     }
   }
@@ -282,6 +283,19 @@ impl Metadata for Superblock {
       ..*self
     })
   }
+  fn extend_from_slice(&self, bs: &[u32]) -> Result<Self, ()> {
+    if self.owned.is_some() {
+      return Err(());
+    }
+    if let &[b] = bs {
+      Ok(Self {
+        owned: Some([b]),
+        ..*self
+      })
+    } else {
+      Err(())
+    }
+  }
   fn remove(&self, b: u32) -> Result<Self, ()> {
     if self.owned != Some([b]) {
       return Err(());
@@ -308,21 +322,51 @@ impl Metadata for RangeMetadata {
   const LEN: usize = core::mem::size_of::<Self>();
   fn insert(&self, b: u32) -> Result<Self, ()> {
     if self.count == 0 {
-      return Ok(Self { start: b, count: 1 });
-    }
-    // Handle an extra block after the end of this one
-    if b == self.start + self.count {
-      return Ok(Self {
+      Ok(Self { start: b, count: 1 })
+    } else if b == self.start + self.count {
+      // Handle an extra block after the end of this one
+      Ok(Self {
         start: self.start,
         count: self.count + 1,
-      });
+      })
     } else if b == self.start.checked_sub(1).ok_or(())? {
-      return Ok(Self {
+      // Or before the beginning
+      Ok(Self {
         start: self.start - 1,
         count: self.count + 1,
-      });
+      })
+    } else {
+      Err(())
     }
-    Err(())
+  }
+
+  fn extend_from_slice(&self, bs: &[u32]) -> Result<Self, ()> {
+    let (&start, rest) = bs.split_first().ok_or(())?;
+    let mut prev = start;
+    for &curr in rest.iter() {
+      if curr - prev != 1 {
+        return Err(());
+      }
+      prev = curr;
+    }
+    if self.count == 0 {
+      Ok(Self {
+        start,
+        count: rest.len() as u32 + 1,
+      })
+    } else if start == self.start + self.count {
+      Ok(Self {
+        start: self.start,
+        count: self.count + 1 + rest.len() as u32,
+      })
+    } else if self.start == start + rest.len() as u32 + 1 {
+      Ok(Self {
+        start,
+        count: self.count + 1 + rest.len() as u32,
+      })
+    } else {
+      Err(())
+    }
   }
 
   fn remove(&self, _b: u32) -> Result<Self, ()> {
@@ -457,13 +501,13 @@ where
     out
   }
   /// Opens a file to the root directory of the file system.
-  pub fn root_dir(&mut self, mode: FileMode) -> Result<FileDescriptor, OpenErr> {
+  pub fn root_dir(&mut self, mode: FileMode) -> Result<FileDescriptor, ()> {
     let (i, fd) = self
       .file_descs
       .iter_mut()
       .enumerate()
       .find(|(_, fd)| fd.open_refs == 0)
-      .ok_or(OpenErr::NoFreeFDs)?;
+      .ok_or(())?;
     fd.inode = 0;
     fd.open_refs += 1;
     fd.offset = 0;
@@ -973,6 +1017,7 @@ where
       (a, b) if a == b => return Ok(()),
       // Always fine
       (_, INodeKind::File) => {},
+      (_, INodeKind::Contiguous) => todo!(),
       (_, INodeKind::Directory) =>
         if inode.size != core::mem::size_of::<Directory>() as u32 {
           return Err(ModifyKindErr::DirSizeMismatch);
@@ -985,11 +1030,6 @@ where
 
   /// Removes a directory from a given reference path with the given name
   pub fn rmdir(&mut self, fd: FileDescriptor, path: &[&str]) -> Result<(), RmdirErr> {
-    let last_entry = match path.last() {
-      None => return Err(RmdirErr::OpenErr(OpenErr::MustProvideFileName)),
-      Some(&"." | &"..") => return Err(RmdirErr::CannotRmdirSelfOrParent),
-      Some(v) => v,
-    };
     let (fd, (curr_dir_inode_num, curr_dir_inode, curr_dir)) =
       self.open_with_dir(fd, path, FileMode::MustExist)?;
     if !self.is_directory(fd)? {
@@ -1003,7 +1043,13 @@ where
       return Err(RmdirErr::NotEmpty);
     }
 
-    self.unlink_from_dir(fd, curr_dir_inode_num, curr_dir_inode, curr_dir, last_entry)?;
+    self.unlink_from_dir(
+      fd,
+      curr_dir_inode_num,
+      curr_dir_inode,
+      curr_dir,
+      path.last().unwrap(),
+    )?;
     Ok(())
   }
 
@@ -1120,8 +1166,7 @@ define_error!(MkdirErr: [] OpenErr(OpenErr), WriteErr(WriteErr), ModifyKindErr(M
 define_error!(
   RmdirErr:
   NotDirectory,
-  NotEmpty,
-  CannotRmdirSelfOrParent
+  NotEmpty
   []
   OpenErr(OpenErr),
   WriteErr(WriteErr),
