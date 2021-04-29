@@ -1,0 +1,380 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix-2020-09}
+
+% to be able to draw some self-contained figs
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage{listings}
+
+\definecolor{GrayCodeBlock}{RGB}{241,241,241}
+\definecolor{BlackText}{RGB}{110,107,94}
+\definecolor{RedTypename}{RGB}{182,86,17}
+\definecolor{GreenString}{RGB}{96,172,57}
+\definecolor{PurpleKeyword}{RGB}{184,84,212}
+\definecolor{GrayComment}{RGB}{170,170,170}
+\definecolor{GoldDocumentation}{RGB}{180,165,45}
+\lstdefinelanguage{rust} {
+    columns=fullflexible,
+    keepspaces=true,
+    frame=single,
+    framesep=0pt,
+    framerule=0pt,
+    framexleftmargin=4pt,
+    framexrightmargin=4pt,
+    framextopmargin=5pt,
+    framexbottommargin=3pt,
+    xleftmargin=4pt,
+    xrightmargin=4pt,
+    backgroundcolor=\color{GrayCodeBlock},
+    basicstyle=\ttfamily\color{BlackText},
+    keywords={
+        true,false,
+        unsafe,async,await,move,
+        use,pub,crate,super,self,mod,
+        struct,enum,fn,const,static,let,mut,ref,type,impl,dyn,trait,where,as,
+        break,continue,if,else,while,for,loop,match,return,yield,in
+    },
+    keywordstyle=\color{PurpleKeyword},
+    ndkeywords={
+        bool,u8,u16,u32,u64,u128,i8,i16,i32,i64,i128,char,str,
+        Self,Option,Some,None,Result,Ok,Err,String,Box,Vec,Rc,Arc,Cell,RefCell,HashMap,BTreeMap,
+        macro_rules
+    },
+    ndkeywordstyle=\color{RedTypename},
+    comment=[l][\color{GrayComment}\slshape]{//},
+    morecomment=[s][\color{GrayComment}\slshape]{/*}{*/},
+    morecomment=[l][\color{GoldDocumentation}\slshape]{///},
+    morecomment=[s][\color{GoldDocumentation}\slshape]{/*!}{*/},
+    morecomment=[l][\color{GoldDocumentation}\slshape]{//!},
+    morecomment=[s][\color{RedTypename}]{\#![}{]},
+    morecomment=[s][\color{RedTypename}]{\#[}{]},
+    stringstyle=\color{GreenString},
+    string=[b]"
+}
+
+
+%-------------------------------------------------------------------------------
+\begin{document}
+%-------------------------------------------------------------------------------
+
+\title{A Small File System in an Exokernel-based OS}
+
+%for single author (just remove % characters)
+\author{
+  {\rm Julian Knodt} \\
+  {\rm COS 598D, taught by Amit Levy}
+}
+
+\date{}
+\maketitle
+
+%-------------------------------------------------------------------------------
+\begin{abstract}
+%-------------------------------------------------------------------------------
+We implement a basic file system on top of a toy operating system based off of Exokernel,
+exploring the cost of implementing a userspace file system in that environment, and examining
+the overhead introduced by it.
+\end{abstract}
+
+
+%-------------------------------------------------------------------------------
+\section{Introduction}
+%-------------------------------------------------------------------------------
+
+During this course, we examined a number of early operating system design approaches, including
+the monolithic approach, the microkernel approach, and the exokernel approach. The monolothic
+approach has won out in terms of use in industry, with Linux, Mac and Windows. Despite that,
+smaller kernels provide some theoretical benefits, including extensibility, and performance
+benefits. Notably, Exokernel~\cite{exokernel} directly exposes hardware mechanisms, and uses a
+different approach to safety by offering capabilities, and secure bindings through hardware and
+software. One notable component missing from the original Exokernel paper is the inclusion of
+multiplexing external resources, including disk, and that how might affect the downstream
+file system. This is addressed in Engler's thesis, where he proposes a simple functional
+methodology for maintaining ownership of various components of the disk, by directly mapping
+ownership of each component. While Engler proposes a very high level description, we explore an
+actual implementation of this, on Arm with a simple OS.
+
+%-------------------------------------------------------------------------------
+\section{Approach}
+%-------------------------------------------------------------------------------
+
+\subsection{Exokernel}
+
+I built the OS in Rust, due to its speed, ease of implementing low-level operations, and my
+familiarity with it. We initially started with a popular x86 implementation as provided by Phil
+Opperman's blog, and fork it with only the basic bootloader and text console implemented.
+
+We quickly run into issues later, as described in the VirtIO Block Driver section, and switch to
+the Arm architecture, with a UART driver and a VirtIO Block Driver, and use this to implement
+our file system.
+
+\subsection{Device Interface}\label{sec:gbi}
+
+In parallel to implementing the operating system, I build an interface which exposes the
+underlying block device's sectors/blocks for reading and writing, which I call the global block
+interface (GBI), called so because it is intended to be a singleton inside of the global system
+for reading and writing to a single device. The GBI requires that a device be readable and
+writable to a specific block number, each block is of a fixed size, and the total size of the
+device is known at compile time. These restrictions, notably the compile-time fixed size
+requirement, may not be strictly necessary, but make it convenient to implement our system.
+
+The GBI provides two main components, a record of remaining free blocks on the device, and a
+capability for tracking owned blocks which is checked when modifying a given block. This
+overhead is constant for the current system, and is relatively fixed because currently only the
+file system interacts with the block interface. In order to persist the GBI, the first 5 blocks
+of the device are reserved for its use, which was a conservative estimate while implementing the
+system. These blocks which are necessary for persisting capabilities, owners, and the set of
+free blocks. It is unclear from Engler's thesis what the overhead he proposed was, but for a
+fine-grained ownership policy, it seems necessary to have at least $O(N)$ extra storage with
+respect to the number of blocks, implemented with a bit array, on top of the metadata necessary
+to track which are in use. Importantly, the allocation of blocks to a specific process does not
+provide information on usage, and for our implementation we have an additional bit array inside
+of the file system to track which of the allocated sectors are currently being used.
+
+An alternative but more memory optimal, approach in practical use-cases could be to use an
+interval tree, which provides a more cost-effective map for coarse-grained allocations, which is
+likely all that is necessary for the GBI. This requires heap allocations though, and is not
+currently implemented.
+
+We expect in general for there to be relatively few processes directly using the interface at a
+given time, as in most production systems a user interacts with the device purely through the
+file system, so we expect that the overhead of the GBI would remain constant in a practical
+system.
+
+I test the GBI using Linux's file API, treating a single file as a fixed number of sectors, and
+atomically writing a sector at a time to the file. This mimicks the functionality of a
+block-device, and was useful for testing the file system without requiring a completed driver.
+
+\subsection{Metadata}
+
+In order to encode "ownership" of blocks, we follow Engler's thesis, and allow for the building
+of metadata which satisfies the following interface:
+\begin{lstlisting}[language=rust, basicstyle=\small]
+interface Metadata: Serializable, Deserializable {
+  fn empty() -> Self
+  fn take_ownership(&self, block_num: uint) -> Self | Error
+  fn release(&self, block_num: uint) -> Self | Error
+  fn owned(&self) -> &[uint]
+}
+\end{lstlisting}\footnote{Uints here are 32 bit, but this is an implementation detail.}
+
+\textit{empty} creates an empty instance of the metadata, which the GBI verifies does not own
+any blocks, otherwise it rejects it. \textit{take\_ownership} adds an additional block to the
+given metadata, or permits for the metadata to reject the block. It is enforced that the
+difference between the original metadata and the created one is precisely the given block,
+otherwise the GBI rejects it. We use a functional interface, constructing an entirely new
+metadata each time, in the case that the GBI rejects the modification. This allows us to ensure
+that no changes occur, assuming that a type-safe language is used to enforce immutability
+inside each of the functions. \textit{release} is identical in behavior, but removes a block
+instead of adding one. It is currently not used in our system, because the file system never
+needs to relinquish resources back to the driver.
+
+\textit{owned} is the most important part of the interface, as it is necessary to allow the GBI
+to enforce invariants about ownership of specific blocks. For a given metadata, it should
+deterministically return the same set of owned blocks in sorted order, and not be able to use
+any information about the caller in order to modify the set of owned blocks. Whether this is
+possible in a type-safe language without explicitly passing it is not clear to me.
+
+We also enforce that any Metadata is serializable and deserializable to disk, so that the GBI
+can persist this metadata across runs. We keep a flat list of all Metadata, and for ease of
+implementation we keep single enum over all types of Metadata. In a practical system, this would
+require us to recompile the system whenever an additional metadata is added, but we expect this
+to be rare because we expect applications that directly utilize the block interface to be rare,
+but nonzero.
+
+Despite the simplicity the simplicity of this interface, it is possible that it may
+cause issues if there is a malicious (or buggy) process it may end up causing issues by abusing
+memory. Consider some naive implementation of metadata which keeps a vector, and stores
+every block. Upon any insertion or deletion, it would be necessary to clone over the entire list
+of items, which may be unnecessarily slow. More importantly, it would also likely take a
+significant portion of space on disk, and multiple instances of these may make the space needed
+to store the GBI larger than the space allocated for it. To prevent this, it might also be
+necessary to enforce some token system for each process that directly uses the GBI, and only
+allocate a fixed set of bytes for each process's metadata. We also implicitly get protection by
+having a fixed set of implementors, which probably suffices without costing programmer burden.
+
+\subsubsection{Metadata Implementations}
+
+We implement two structs which satisfy the Metadata interface: one for singleton blocks,
+and one for contiguous ranges of sectors. We note that while technically everything can be done
+with contiguous ranges of sectors, having multiple different kinds allows for selecting one
+which seems most appropriate.
+
+For singleton blocks, we have a simple metadata which contains an optional uint, as
+described by the struct:
+\begin{lstlisting}[language=rust, basicstyle=\small]
+struct Singleton: Metadata {
+  magic_number: int,
+  block: uint?,
+}
+\end{lstlisting}
+
+We use this for the superblock of the file system, with an associated magic number to assert
+that this is the correct metadata for the file system. This structs accept one block and rejects
+any more that are added, and will relinquish the block it currently has and will error if others
+are given.
+
+For contiguous ranges, we have metadata which stores the start and number of blocks:
+\begin{lstlisting}[language=rust, basicstyle=\small]
+struct Range: Metadata {
+  start: uint,
+  length: uint = 0,
+}
+\end{lstlisting}
+
+An empty range has any value for start, and 0 length, and will change start to the first block
+inserted and have length 1. For subsequent blocks, we check that they either follow directly
+after or directly before the beginning of the range, and update the start or len accordingly.
+Releasing blocks would take the same form, only allowing for taking blocks from the beginning or
+end. We have two separate instances of this for the inodes and the data blocks in the file system.
+While they could be coalesced, it is easier to keep track of two with separate local offsets.
+
+It is not immediately clear whether these two structures will satisfy most use-cases, but they
+are memory-efficient, which is especially necessary since the structs are immutable. We do not
+expect metadata to be significantly more complex because of this requirement, and also to
+hopefully not allocate, as that may cause a large number of allocations if a large number of
+blocks are stored.
+
+\subsection{VirtIO Block Driver}\footnote{This section is more a personal vendetta, than
+anything research related.}
+
+One of the simpler devices for reading and writing to disk blocks is provided by VirtIO, inside
+of QEMU~\cite{qemu}. While initially implementing on x86, I found difficulty implementing the
+QEMU's legacy VirtIO interface, partially because it was not clear at the start whether it was
+using the legacy interface initially, and thus there was a mismatch in what I thought and the
+documentation. In addition, even after implementing the spec for the legacy interface, despite
+closely following the specification, the VirtQueues did not work as expected, and the issue was
+completely opaque. Thus, I hit a roadblock implementing the VirtIO device. Thankfully, Professor
+Levy bailed me out, with an implementation of the VirtIO block driver in Arm, which is why the
+project ended up being for Arm. The Arm implementation simplified multiple components, such as
+switching from PCI configuration space to memory mapped devices exposed through the device tree.
+
+Even with an implemented VirtIO block driver, there are some additional implementation details.
+We only expose through the driver through the GBI~\ref{sec:gbi}, and the capacity of the driver is
+not compile-time constant in our system, as it is just a non-appendable file exposed through
+QEMU. We treat it as compile-time constant though, by fixing the size of the file to a specific
+size (2048 512-byte sectors), and hard-coding that in our system. We do not use any additional
+features that are present in the block device, and thus did not implement any way for an
+end-user to see those directly, although this should be a relatively simple read-only API.
+
+\subsection{File System}
+
+The file-system is a primitive Unix-based~\cite{unix} filesystem, organized on disk as file
+system metadata, a contiguous set of inodes, and a contiguous set of blocks for file data. Our
+file system maintains relatively little metadata for itself, maintaining a magic number, and a
+set of bit arrays for the usage maps of the inodes and data blocks. We also implicitly store
+ownership metadata of the superblock, the inodes, and data blocks, through metadata in the GBI,
+which is persisted in the GBI's reserved space. This is relatively cheap, as they are stored as
+a contiguous range, and thus need only a start and end sector numbers to encode the range of
+owned blocks.
+
+One side-effect of the GBI is that we can encode all sectors in the file system in
+a "local" sector space, meaning that the numbering of the inode blocks and data blocks is
+independent of each other. In order to read or write to some block, we must pass a reference to
+the metadata stored in the GBI and an offset, which enforces the security that we can only read
+or write to blocks designed as owned by that metadata.
+
+While implementing the file-system, we do not notice any difference while programming as
+compared to a normal system, except for having to pass extra metadata handles while performing
+reads and writes, and handling initialization by looking for metadata in the GBI.
+
+In order to get an understanding of the cost of the extra layer of indirection, we compare our
+implementation against direct reads and writes to a linux file. We note that we expect ours to
+be slower, as there is an extra information that needs to be updated and more operations that
+need to be performed as compared to reading or writing directly to the file.
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{|c|c|c|c|}
+    ns\/op      & S      & S+R  & S+W \\
+    \hline
+    Exokernel  & 1$^{*}$& 1616($\pm 261$) & 2680 ($\pm 593$) \\
+    \hline
+    Linux File & 462($\pm 26$)    & 1479($\pm 86$) & 3412 ($\pm 874$) \\
+  \end{tabular}
+  \caption{
+    \label{tab:cmp}
+    I compare Exokernel which uses linux files as backing to direct operations on a linux file.
+    We perform strictly more work than the Linux file, so we hope to minimize the overhead of
+    these operations. $^*$ We note that this is not correct, as the compiler is
+    eliding operations, but even specifically marking components to be unoptimized did not
+    change the benchmark. We note that the performance is probably around the same, because
+    the other benchmarks also uses seeks.
+  }
+\end{table}
+
+We describe the comparisons in Table~\ref{tab:cmp}. We do not see a significant overhead from
+our implementation but note that we do not include such thnigs as locking, or other atomics. In
+addition, we note that it was necessary to optimize our write implementation to cache writes to
+inodes, which essentially removes the cost from the benchmark since the same file is being
+written to each time. I think this is a justifiable optimization, as the cost of writing the
+metadata to disk after every write is quite high.
+
+%-------------------------------------------------------------------------------
+\bibliographystyle{plain}
+\bibliography{\jobname}
+
+%-------------------------------------------------------------------------------
+\begin{filecontents}{\jobname.bib}
+%-------------------------------------------------------------------------------
+@inproceedings{exokernel,
+  author = {Engler, D. R. and Kaashoek, M. F. and O'Toole, J.},
+  title = {Exokernel: An Operating System Architecture for Application-Level Resource Management},
+  year = {1995},
+  isbn = {0897917154},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  url = {https://doi.org/10.1145/224056.224076},
+  doi = {10.1145/224056.224076},
+  booktitle = {Proceedings of the Fifteenth ACM Symposium on Operating Systems Principles},
+  pages = {251–266},
+  numpages = {16},
+  location = {Copper Mountain, Colorado, USA},
+  series = {SOSP '95}
+}
+@inproceedings{10.5555/1247360.1247401,
+  author = {Bellard, Fabrice},
+  title = {QEMU, a Fast and Portable Dynamic Translator},
+  year = {2005},
+  publisher = {USENIX Association},
+  address = {USA},
+  abstract = {We present the internals of QEMU, a fast machine emulator using an original portable dynamic translator. It emulates several CPUs (x86, PowerPC, ARM and Sparc) on several hosts (x86, PowerPC, ARM, Sparc, Alpha and MIPS). QEMU supports full system emulation in which a complete and unmodified operating system is run in a virtual machine and Linux user mode emulation where a Linux process compiled for one target CPU can be run on another CPU.},
+  booktitle = {Proceedings of the Annual Conference on USENIX Annual Technical Conference},
+  pages = {41},
+  numpages = {1},
+  location = {Anaheim, CA},
+  series = {ATEC '05}
+}
+@article{unix,
+  author = {Ritchie, Dennis M. and Thompson, Ken},
+  title = {The UNIX Time-Sharing System},
+  year = {1974},
+  issue_date = {July 1974},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  volume = {17},
+  number = {7},
+  issn = {0001-0782},
+  url = {https://doi.org/10.1145/361011.361061},
+  doi = {10.1145/361011.361061},
+  journal = {Commun. ACM},
+  month = jul,
+  pages = {365–375},
+  numpages = {11},
+  keywords = {command language, time-sharing, file system, PDP-11, operating system}
+}
+@inproceedings{qemu,
+  author = {Fabrice Bellard},
+  title = {{QEMU}, a Fast and Portable Dynamic Translator},
+  booktitle = {2005 {USENIX} Annual Technical Conference ({USENIX} {ATC} 05)},
+  year = {2005},
+  address = {Anaheim, CA},
+  url = {https://www.usenix.org/conference/2005-usenix-annual-technical-conference/qemu-fast-and-portable-dynamic-translator},
+  publisher = {{USENIX} Association},
+  month = apr,
+}
+\end{filecontents}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\end{document}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
