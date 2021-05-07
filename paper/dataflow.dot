@@ -1,0 +1,6 @@
+strict digraph {
+  BlockDevice -> GBI [label="Entirely within Kernel", dir=both];
+  GBI -> FS [label="User Read, updating mutable buffer"];
+  FS -> GBI [label="User Write, passing RO buffer"];
+  {rank=same;BlockDevice GBI FS}
+}

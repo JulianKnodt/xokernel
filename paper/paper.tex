@@ -37,10 +37,11 @@
     keywordstyle=\color{PurpleKeyword},
     ndkeywords={
         bool,u8,u16,u32,u64,u128,i8,i16,i32,i64,i128,char,str,
+        uint,int,
         Self,Option,Some,None,Result,Ok,Err,String,Box,Vec,Rc,Arc,Cell,RefCell,HashMap,BTreeMap,
         macro_rules
     },
-    ndkeywordstyle=\color{RedTypename},
+    ndkeywordstyle=\color{GreenString},
     comment=[l][\color{GrayComment}\slshape]{//},
     morecomment=[s][\color{GrayComment}\slshape]{/*}{*/},
     morecomment=[l][\color{GoldDocumentation}\slshape]{///},
@@ -71,149 +72,201 @@
 %-------------------------------------------------------------------------------
 \begin{abstract}
 %-------------------------------------------------------------------------------
-We implement a basic file system on top of a toy operating system based off of Exokernel,
-exploring the cost of implementing a userspace file system in that environment, and examining
-the overhead introduced by it.
+I implement a basic file system on top of a small Exokernel-based operating system,
+exploring the cost of implementing a userspace file system and examining
+the overhead introduced by it. Using microbenchmarks to compare the efficiency of reads and
+writes to a single file, it does not appear that the Exokernel approach introduces significant
+overhead as compared to reading or writing directly to blocks.
 \end{abstract}
-
-
-%-------------------------------------------------------------------------------
+\vspace{-12pt}
 \section{Introduction}
 %-------------------------------------------------------------------------------
-
 During this course, we examined a number of early operating system design approaches, including
-the monolithic approach, the microkernel approach, and the exokernel approach. The monolothic
-approach has won out in terms of use in industry, with Linux, Mac and Windows. Despite that,
-smaller kernels provide some theoretical benefits, including extensibility, and performance
-benefits. Notably, Exokernel~\cite{exokernel} directly exposes hardware mechanisms, and uses a
-different approach to safety by offering capabilities, and secure bindings through hardware and
-software. One notable component missing from the original Exokernel paper is the inclusion of
-multiplexing external resources, including disk, and that how might affect the downstream
-file system. This is addressed in Engler's thesis, where he proposes a simple functional
-methodology for maintaining ownership of various components of the disk, by directly mapping
-ownership of each component. While Engler proposes a very high level description, we explore an
-actual implementation of this, on Arm with a simple OS.
+the monolithic~\cite{unix} approach, the microkernel~\cite{microkernel} approach, and the
+Exokernel~\cite{exokernel} approach. The monolothic approach has won out in terms of use in
+industry, with Linux, Mac and Windows. Despite their rarity, alternative kernels provide some
+theoretical benefits, including extensibility, and performance benefits. Notably,
+Exokernel~\cite{exokernel} directly exposes hardware mechanisms, and uses a different approach
+to safety by offering capabilities, and secure bindings through hardware and software. One
+notable component missing from the original Exokernel paper is the inclusion of multiplexing
+external resources, including disk, and that how might affect the downstream file system. This
+is addressed in Engler's thesis~\cite{proto_exo}, where he proposes a simple functional
+methodology for maintaining ownership of various components of the disk, by directly tracking
+ownership of each block or sector.  While Engler proposes a high level description, which was
+likely implemented in Aegis and ExOS, we explore our own implementation of this, on ARM with a
+simple OS.
 
+All code of this project is available at \url{https://github.com/JulianKnodt/xokernel}.
 %-------------------------------------------------------------------------------
 \section{Approach}
 %-------------------------------------------------------------------------------
-
 \subsection{Exokernel}
 
-I built the OS in Rust, due to its speed, ease of implementing low-level operations, and my
-familiarity with it. We initially started with a popular x86 implementation as provided by Phil
-Opperman's blog, and fork it with only the basic bootloader and text console implemented.
+Since this work is an exploration of the implementation details that might be missing from
+the original work, we provide some initial details of our implementation up front, and discuss
+higher-level design decisions later. Our design almost directly follows the original paper, and
+we refer to that for justification about specific choices.
 
-We quickly run into issues later, as described in the VirtIO Block Driver section, and switch to
-the Arm architecture, with a UART driver and a VirtIO Block Driver, and use this to implement
-our file system.
+The OS is built in Rust, due to its speed, ease of implementing low-level operations, and the
+author's familiarity with it. It initially started with a popular x86 kernel as provided by Phil
+Opperman's blog, forked with only the basic bootloader and text console implemented. This
+quickly ran into issues later, as described in the VirtIO Block Driver section, and we switch to
+the ARM architecture, with a UART driver and a VirtIO Block Driver, and use this setup
+to implement our file system.
 
-\subsection{Device Interface}\label{sec:gbi}
+We show a small diagram of our final dataflow path, along with the corresponding checks
+necessary for a program to perform a read or write from the GBI in Fig.~\ref{fig:dataflow}. This
+diagram encompasses most of the high level components in our system.
 
-In parallel to implementing the operating system, I build an interface which exposes the
-underlying block device's sectors/blocks for reading and writing, which I call the global block
-interface (GBI), called so because it is intended to be a singleton inside of the global system
-for reading and writing to a single device. The GBI requires that a device be readable and
-writable to a specific block number, each block is of a fixed size, and the total size of the
-device is known at compile time. These restrictions, notably the compile-time fixed size
-requirement, may not be strictly necessary, but make it convenient to implement our system.
+\begin{figure*}
+  \centering
+  \includegraphics[width=0.8\textwidth]{dataflow}
+  \includegraphics[width=0.6\textwidth]{permissions}
+  \caption{
+    Flow of data in our system. The GBI has unrestricted access to blocks, but only provides
+    them to users who have ensured sole ownership through its interface. The flowchart describes
+    the procedure for any program to request ownership of blocks in our system, which is
+    relatively straightforward and is only necessary upon initialization of a new program that
+    requires direct block access.
+  }
+  \label{fig:dataflow}
+\end{figure*}
 
-The GBI provides two main components, a record of remaining free blocks on the device, and a
-capability for tracking owned blocks which is checked when modifying a given block. This
-overhead is constant for the current system, and is relatively fixed because currently only the
-file system interacts with the block interface. In order to persist the GBI, the first 5 blocks
-of the device are reserved for its use, which was a conservative estimate while implementing the
-system. These blocks which are necessary for persisting capabilities, owners, and the set of
-free blocks. It is unclear from Engler's thesis what the overhead he proposed was, but for a
-fine-grained ownership policy, it seems necessary to have at least $O(N)$ extra storage with
-respect to the number of blocks, implemented with a bit array, on top of the metadata necessary
-to track which are in use. Importantly, the allocation of blocks to a specific process does not
-provide information on usage, and for our implementation we have an additional bit array inside
-of the file system to track which of the allocated sectors are currently being used.
+Our operating system consists of two main components:
+\begin{enumerate}
+  \item A priviliged kernel, which contains the Global Device Interface as defined in
+  Sec.~\ref{sec:gbi}. This is responsible for validating operations to the block device and
+  acting as a device driver. The kernel also contains a UART driver for debugging and seeing
+  output.
 
-An alternative but more memory optimal, approach in practical use-cases could be to use an
-interval tree, which provides a more cost-effective map for coarse-grained allocations, which is
-likely all that is necessary for the GBI. This requires heap allocations though, and is not
-currently implemented.
+  \item A userspace file system, which is built on top of the Global Device Interface. It
+  operates similarly to a standard Unix FS.
+\end{enumerate}
 
-We expect in general for there to be relatively few processes directly using the interface at a
+\subsection{Global Device Interface}\label{sec:gbi}
+
+While implementing the Exokernel-based operating system, it's necessary to build an interface
+which exposes the underlying block device's sectors/blocks for reading and writing, which I call
+the global block interface (GBI). It is called so because it is intended to be a global
+singleton inside of the whole system for reading and writing to a single device, acting as a
+driver. Our implementation of a GBI requires that a device be readable and writable to a
+specific block number, each block is of a fixed size, and the total size of the device is known
+at compile time. These restrictions, notably the compile-time fixed size requirement, may not be
+strictly necessary, but make it convenient to implement our system.
+
+The GBI provides two main functions: tracking remaining free blocks on the device, and providing
+capabilities for operating on owned blocks. I expect the overhead of these functions to be
+constant for the current system, and this is because currently only the file system interacts
+with the block interface. In order to persist the GBI, the first 5 blocks of the device are
+reserved for its use, which was a conservative estimate while building the system. These blocks
+are necessary for persisting capabilities, owner IDs, and the bit-array which tracks ownership.
+It is unclear from Engler's thesis what the overhead he proposed was, but for a fine-grained
+ownership policy, it seems necessary to have at least $O(N)$ extra storage with respect to the
+number of blocks, in our case implemented as a bit array, which is in addition to the metadata
+necessary to track which are in use\footnote{Engler does not seem to make a distinction between
+ownership and in-use, but we find it necessary to track both separately.}. Importantly, the
+allocation of blocks to a specific process does not provide information on usage, and for our
+implementation we have an additional bit array inside of the file system to track which of the
+allocated sectors are currently being used.
+
+An alternative but more memory optimal approach in practical use-cases could be to use an
+interval tree over bit-arrays, which provide a more cost-effective map for coarse-grained
+allocations that may be sufficient for real use-cases for the GBI. This requires heap
+allocations though, and is not currently implemented.
+
+I expect in general for there to be relatively few processes directly using the interface at a
 given time, as in most production systems a user interacts with the device purely through the
 file system, so we expect that the overhead of the GBI would remain constant in a practical
 system.
 
-I test the GBI using Linux's file API, treating a single file as a fixed number of sectors, and
-atomically writing a sector at a time to the file. This mimicks the functionality of a
-block-device, and was useful for testing the file system without requiring a completed driver.
+The GBI is tested and benchmarked on top of a mock device using Linux's file API, treating a
+single file as a fixed number of sectors, and atomically writing a sector at a time to the file.
+This mimicks the functionality of a block-device, and was useful for testing the file system
+without requiring a completed driver, and the performance overheads are described in later
+sections.
 
-\subsection{Metadata}
+\subsubsection{Metadata}
 
-In order to encode "ownership" of blocks, we follow Engler's thesis, and allow for the building
-of metadata which satisfies the following interface:
+In order to encode "ownership" of blocks in the GBI, we follow Engler's thesis, and allow for
+the building of ``Metadata'' which satisfies the following interface:
+
 \begin{lstlisting}[language=rust, basicstyle=\small]
-interface Metadata: Serializable, Deserializable {
+interface Metadata: Serializable + Deserializable {
   fn empty() -> Self
   fn take_ownership(&self, block_num: uint) -> Self | Error
   fn release(&self, block_num: uint) -> Self | Error
   fn owned(&self) -> &[uint]
 }
-\end{lstlisting}\footnote{Uints here are 32 bit, but this is an implementation detail.}
+\end{lstlisting}
+\footnotetext{Uints here are 32 bit, but this is an implementation detail.}
 
 \textit{empty} creates an empty instance of the metadata, which the GBI verifies does not own
-any blocks, otherwise it rejects it. \textit{take\_ownership} adds an additional block to the
-given metadata, or permits for the metadata to reject the block. It is enforced that the
-difference between the original metadata and the created one is precisely the given block,
-otherwise the GBI rejects it. We use a functional interface, constructing an entirely new
-metadata each time, in the case that the GBI rejects the modification. This allows us to ensure
-that no changes occur, assuming that a type-safe language is used to enforce immutability
-inside each of the functions. \textit{release} is identical in behavior, but removes a block
-instead of adding one. It is currently not used in our system, because the file system never
-needs to relinquish resources back to the driver.
+any blocks, otherwise it rejects the allocation request. \textit{take\_ownership} adds an
+additional block to the given metadata, or permits for the metadata to reject the block if it so
+chooses. It is enforced that the difference between the original metadata and the created one is
+precisely the given block, otherwise the GBI rejects the modification. I use a functional
+interface, constructing an entirely new metadata each time, in the case that the GBI rejects the
+modification. This allows us to ensure that no changes occur, through the type-safe immutability
+enforced inside each of the functions. \textit{release} is identical in behavior, but removes a
+block instead of adding one. It is currently not used in our system, because the file system
+never needs to relinquish resources back to the driver.
 
 \textit{owned} is the most important part of the interface, as it is necessary to allow the GBI
 to enforce invariants about ownership of specific blocks. For a given metadata, it should
 deterministically return the same set of owned blocks in sorted order, and not be able to use
-any information about the caller in order to modify the set of owned blocks. Whether this is
-possible in a type-safe language without explicitly passing it is not clear to me.
+any information about the caller in order to modify the set of owned blocks. Whether it is
+possible to find caller information in a type-safe language without explicitly passing it as an
+argument is not clear to me.
 
-We also enforce that any Metadata is serializable and deserializable to disk, so that the GBI
-can persist this metadata across runs. We keep a flat list of all Metadata, and for ease of
-implementation we keep single enum over all types of Metadata. In a practical system, this would
-require us to recompile the system whenever an additional metadata is added, but we expect this
-to be rare because we expect applications that directly utilize the block interface to be rare,
-but nonzero.
+Metadata is enforced to be serializable and deserializable to disk, so that the GBI can persist
+this metadata across shutdown. The GBI maintains a flat array of all metadata, and for ease of
+implementation there is a single compile-time constant over all types of metadata. In a
+practical system, this would require us to recompile the system whenever additional metadata is
+added, but we expect this to be rare because applications that directly utilize the block
+interface are likely rare, but nonzero. An alternative approach may be to include a virtual
+dispatch instead, but this would incur additional runtime overhead and thus may be suboptimal in
+static systems.
 
-Despite the simplicity the simplicity of this interface, it is possible that it may
-cause issues if there is a malicious (or buggy) process it may end up causing issues by abusing
-memory. Consider some naive implementation of metadata which keeps a vector, and stores
-every block. Upon any insertion or deletion, it would be necessary to clone over the entire list
-of items, which may be unnecessarily slow. More importantly, it would also likely take a
-significant portion of space on disk, and multiple instances of these may make the space needed
-to store the GBI larger than the space allocated for it. To prevent this, it might also be
-necessary to enforce some token system for each process that directly uses the GBI, and only
-allocate a fixed set of bytes for each process's metadata. We also implicitly get protection by
-having a fixed set of implementors, which probably suffices without costing programmer burden.
+Despite the simplicity the simplicity of this interface, it is possible that it may cause issues
+if there is a malicious (or buggy) process, as it may end up causing issues by abusing memory.
+Consider some naive implementation of metadata with a vector and an entry for each block.
+Upon any insertion or deletion, it would be necessary to clone the entire vector of items, or at
+least maintain a pointer to the old list, which may be unnecessarily slow. More importantly, it
+would also likely take a significant portion of space on disk for the GBI to persist, and
+multiple instances of these may make the space needed to store the GBI larger than the space
+allocated for it. To prevent this, it may be necessary to enforce a token system for each
+process using the GBI, and only allocate a fixed set of bytes for each process's metadata.  In
+our implementation, protection is also implicitly enforced by having a fixed set of implementors
+and ensuring that each one individually is used correctly, which probably suffices for most
+cases without causing additional programmer burden. Whether this approach would be sufficient
+for a larger implementation is unclear.
+
+The flow for using metadata to operate on blocks is best illustrated in Fig.~\ref{fig:dataflow}.
+After creating a metadata in the GBI, the caller receives a capabilitiy which is an opaque
+wrapper around the index for the metadata. The caller passes this handle whenever it desires to
+perform an operation, and the pictured flow is checked.
 
 \subsubsection{Metadata Implementations}
 
-We implement two structs which satisfy the Metadata interface: one for singleton blocks,
-and one for contiguous ranges of sectors. We note that while technically everything can be done
-with contiguous ranges of sectors, having multiple different kinds allows for selecting one
-which seems most appropriate.
+In order for the file system to allocate blocks in the GBI for itself, we implement two structs
+which satisfy the metadata interface: one for singleton blocks, and one for contiguous ranges of
+sectors. I note that while technically everything can be done with contiguous ranges of sectors,
+having multiple distinct kinds allows for separation of concerns and ends up being cleaner to
+use.
 
 For singleton blocks, we have a simple metadata which contains an optional uint, as
 described by the struct:
 \begin{lstlisting}[language=rust, basicstyle=\small]
 struct Singleton: Metadata {
   magic_number: int,
-  block: uint?,
+  block: optional uint,
 }
 \end{lstlisting}
 
-We use this for the superblock of the file system, with an associated magic number to assert
+This is used for the superblock of the file system, with an associated magic number to assert
 that this is the correct metadata for the file system. This structs accept one block and rejects
 any more that are added, and will relinquish the block it currently has and will error if others
 are given.
-
 For contiguous ranges, we have metadata which stores the start and number of blocks:
 \begin{lstlisting}[language=rust, basicstyle=\small]
 struct Range: Metadata {
@@ -224,91 +277,171 @@ struct Range: Metadata {
 
 An empty range has any value for start, and 0 length, and will change start to the first block
 inserted and have length 1. For subsequent blocks, we check that they either follow directly
-after or directly before the beginning of the range, and update the start or len accordingly.
+after or directly before the beginning of the range, and update the start or length accordingly.
 Releasing blocks would take the same form, only allowing for taking blocks from the beginning or
-end. We have two separate instances of this for the inodes and the data blocks in the file system.
-While they could be coalesced, it is easier to keep track of two with separate local offsets.
+end. I have two separate instances of this for the inodes and the data blocks in the file system.
+While they could be coalesced, it is easier to keep track of the two as distinct, with separate
+local offsets.
 
 It is not immediately clear whether these two structures will satisfy most use-cases, but they
-are memory-efficient, which is especially necessary since the structs are immutable. We do not
-expect metadata to be significantly more complex because of this requirement, and also to
-hopefully not allocate, as that may cause a large number of allocations if a large number of
-blocks are stored.
+are memory-efficient, which is especially important since the structs are immutable and need to
+be rebuilt upon modification. We note that it is important that metadata does not allocate,  as
+that may cause a large number of allocations if a large number of blocks are stored since we
+update metadata one block at a time.
 
-\subsection{VirtIO Block Driver}\footnote{This section is more a personal vendetta, than
-anything research related.}
+\subsection{VirtIO Block Driver}
+\footnote{This section is more a personal vendetta, than anything research related.}
 
-One of the simpler devices for reading and writing to disk blocks is provided by VirtIO, inside
-of QEMU~\cite{qemu}. While initially implementing on x86, I found difficulty implementing the
-QEMU's legacy VirtIO interface, partially because it was not clear at the start whether it was
-using the legacy interface initially, and thus there was a mismatch in what I thought and the
-documentation. In addition, even after implementing the spec for the legacy interface, despite
+One of the simpler devices for reading and writing to disk blocks is provided by
+VirtIO~\cite{virtio}, which is available inside of virtual machines such as QEMU~\cite{qemu}.
+While initially implementing on x86, I found difficulty implementing QEMU's legacy VirtIO
+interface, partially because it was not clear at the start whether it was even using the legacy
+interface. In addition, even after implementing the spec for the legacy interface, despite
 closely following the specification, the VirtQueues did not work as expected, and the issue was
 completely opaque. Thus, I hit a roadblock implementing the VirtIO device. Thankfully, Professor
-Levy bailed me out, with an implementation of the VirtIO block driver in Arm, which is why the
-project ended up being for Arm. The Arm implementation simplified multiple components, such as
+Levy bailed me out, with an implementation of the VirtIO block driver in ARM, which is why the
+project ended up being for ARM. The ARM implementation simplified multiple components, such as
 switching from PCI configuration space to memory mapped devices exposed through the device tree.
 
-Even with an implemented VirtIO block driver, there are some additional implementation details.
-We only expose through the driver through the GBI~\ref{sec:gbi}, and the capacity of the driver is
-not compile-time constant in our system, as it is just a non-appendable file exposed through
-QEMU. We treat it as compile-time constant though, by fixing the size of the file to a specific
-size (2048 512-byte sectors), and hard-coding that in our system. We do not use any additional
-features that are present in the block device, and thus did not implement any way for an
-end-user to see those directly, although this should be a relatively simple read-only API.
+Even with an implemented VirtIO block driver, there are some additional implementation details
+for how we expose this driver.  The driver is only exposed through the GBI~\ref{sec:gbi}, and
+the capacity of the driver is not compile-time constant in our system, as it is a standard
+file exposed through QEMU as a VirtIO block device. I treat it as compile-time constant, by
+fixing the size of the file to a specific size (2048 512-byte sectors), and hard-coding that in
+our system. I do not use any additional features that are present in the block device, and thus
+did not implement any way for an end-user of the operating system to see or modify those
+directly, as might be expected in an Exokernel. It's unclear how those global permissions would
+be handled in our approach, since if a program disabled a feature that was relied on elsewhere,
+it might cause issues.
 
 \subsection{File System}
 
-The file-system is a primitive Unix-based~\cite{unix} filesystem, organized on disk as file
-system metadata, a contiguous set of inodes, and a contiguous set of blocks for file data. Our
-file system maintains relatively little metadata for itself, maintaining a magic number, and a
-set of bit arrays for the usage maps of the inodes and data blocks. We also implicitly store
-ownership metadata of the superblock, the inodes, and data blocks, through metadata in the GBI,
-which is persisted in the GBI's reserved space. This is relatively cheap, as they are stored as
-a contiguous range, and thus need only a start and end sector numbers to encode the range of
-owned blocks.
+The file system is a primitive Unix-based~\cite{unix} file system, organized on disk as a super
+block containing metadata, a contiguous set of inodes, and a contiguous set of blocks for file
+data. Our file system maintains relatively little metadata for itself, maintaining a magic
+number, and a set of bit-arrays for tracking usage of the inodes and data blocks. It also
+implicitly stores ownership metadata of the superblock, the inodes, and data blocks, through
+metadata in the GBI, which is persisted in the GBI's reserved space. This is relatively cheap,
+as they are stored as a contiguous range, and thus need only a start and end sector numbers to
+encode the range of owned blocks.
 
-One side-effect of the GBI is that we can encode all sectors in the file system in
-a "local" sector space, meaning that the numbering of the inode blocks and data blocks is
+One effect of using the GBI is that we encode all sectors in the file system in
+a ``local'' sector space, or that the numbering of the inode blocks and data blocks is
 independent of each other. In order to read or write to some block, we must pass a reference to
 the metadata stored in the GBI and an offset, which enforces the security that we can only read
-or write to blocks designed as owned by that metadata.
+or write to blocks designated as owned by that metadata.
 
-While implementing the file-system, we do not notice any difference while programming as
-compared to a normal system, except for having to pass extra metadata handles while performing
-reads and writes, and handling initialization by looking for metadata in the GBI.
+While implementing the file system, we do not notice any difference while programming as compared
+to a normal file system, except for having to pass extra metadata handles while performing reads
+and writes, and some extra work in initialization looking for metadata in the GBI.
 
-In order to get an understanding of the cost of the extra layer of indirection, we compare our
-implementation against direct reads and writes to a linux file. We note that we expect ours to
-be slower, as there is an extra information that needs to be updated and more operations that
-need to be performed as compared to reading or writing directly to the file.
+In order to understand the cost of the extra layer of indirection, we compare our implementation
+against direct reads and writes to a linux file. I note that we expect ours to be slower, as
+there is an extra information that needs to be updated and more operations that need to be
+performed as compared to reading or writing directly to the file.
 
 \begin{table}[t]
   \centering
   \begin{tabular}{|c|c|c|c|}
-    ns\/op      & S      & S+R  & S+W \\
+    \hline
+    ns/op      & Seek      & Seek+Read  & Seek+Write \\
     \hline
     Exokernel  & 1$^{*}$& 1616($\pm 261$) & 2680 ($\pm 593$) \\
     \hline
     Linux File & 462($\pm 26$)    & 1479($\pm 86$) & 3412 ($\pm 874$) \\
+    \hline
+               & \multicolumn{2}{c|}{New+Rm+Close} & Open+Close \\
+    \hline
+    Exokernel  & \multicolumn{2}{c|}{107759($\pm 51696$)} & 13990($\pm 6249$) \\
+    \hline
+    Linux File & \multicolumn{2}{c|}{167986($\pm 41756$)} & 13909($\pm 1009$) \\
+    \hline
   \end{tabular}
   \caption{
     \label{tab:cmp}
-    I compare Exokernel which uses linux files as backing to direct operations on a linux file.
-    We perform strictly more work than the Linux file, so we hope to minimize the overhead of
-    these operations. $^*$ We note that this is not correct, as the compiler is
+    A comparison of the Global Block Interface mocked with linux files as a backing store versus
+    directly operating on a linux file. The GBI performs strictly more work than the Linux file
+    when reading and writing, so we hope to minimize the overhead of these operations. We also
+    compare our implementation's variations of opening and closing files, noting that they are
+    distinct and work necessary for our implementation may be substantially different than that
+    of Linux.
+    \\
+    $^*$ Note that this is not correct, as the compiler is
     eliding operations, but even specifically marking components to be unoptimized did not
-    change the benchmark. We note that the performance is probably around the same, because
-    the other benchmarks also uses seeks.
+    change the benchmark. Note that the performance is probably around the same, because
+    the other benchmarks also use seek, so that additional memory is not allocated.
   }
 \end{table}
 
-We describe the comparisons in Table~\ref{tab:cmp}. We do not see a significant overhead from
-our implementation but note that we do not include such thnigs as locking, or other atomics. In
-addition, we note that it was necessary to optimize our write implementation to cache writes to
-inodes, which essentially removes the cost from the benchmark since the same file is being
-written to each time. I think this is a justifiable optimization, as the cost of writing the
-metadata to disk after every write is quite high.
+We describe the comparisons in Table~\ref{tab:cmp}, and observe that the overhead is on the
+order of a few hundred nanoseconds, and is approximately $20\%$ slower. In some contexts, I
+expect this to not be a significant overhead, and most of the overhead is introduced by our
+implementation of the file system metadata which requires additional reads and writes. Note that
+we do not include such things as locking, or other atomics, which may be required for a more
+mature file system to operate correctly with multiple programs.
+
+The cost of writing metadata, especially in our test-harness, is quite noticeable as it incurs
+at least 1 additional underlying write and seek per call to our implementation's write, so to
+achieve the performance observed in the above benchmark, it was necessary to optimize our write
+implementation to cache inodes so that it was not necessary to go to disk each time. This
+essentially removes a read from disk for file system metadata from the benchmark since the same
+file is being written to each time, and we do not need to update the metadata after each write.
+
+This is a justifiable optimization, as the cost of reading/writing the metadata to disk after
+every write is by itself quite high, and would probably be cached to amortize the cost in a
+production implementation. It might also be expected in the common case that a single file has
+many reads and writes to it, and it would be expected that this case is heavily optimized for in
+production.
+
+For this optimization, the cache is fixed-size and fully-associative, which was chosen because
+we expect relatively few files to be updated at the same time. Unfortunately, this also implies
+that our performance may hit a wall if more files are written to then there is space in the
+cache.
+
+All of the comparisons were run on a 2015 MacBook Air without any process isolation, possibly
+introducing noise. To counter this, I run them under identical conditions sequentially, so any
+systematic difference ought to be consistent across all experiments.
+
+\section{Discussion}
+
+I find that implementing the block interface for Exokernel was relatively straightforward, and I
+did not find any significant difficulty in doing so, outside of alternative design choices for
+metadata. Adding in additional space requirements may lead to more difficulties and it is
+unclear to me precisely what additional complexities would be added by a more complete
+Exokernel.  In comparison to implementing the device driver though, it is definitely simpler.
+
+As observed from our microbenchmarks, there is little overhead for the Exokernel based approach
+when performing reads or writes, as there is only a single additional memory access, and one
+call to \textit{owned}, which is cheap for our implementations. We expect this overhead to be
+negligible for practical implementations, as its expected that block ownership is static for the
+most part, so we do not consider that overhead. This is a reasonable assumption, as for a given
+OS it's unlikely for there to be multiple file systems, and programs that directly need access
+to the block device would likely be rare, as most applications would perform sufficiently
+without it.
+
+I hope this demonstrates the feasibility of implementing research kernel's with an Exokernel
+based approach, as it allowed for focusing on singular components of the kernel that are
+relevant to the research while allowing for greenfielding. I do not argue that an Exokernel can
+replace the monolithic approach, as from this alone it is not clear whether that is justifiable,
+although I'd personally like to believe that the underlying design is not the key factor in this
+pivot.
+
+\section{Conclusion}
+
+I implement a simple file system on top of an Exokernel, and do not notice significant deviation
+from Engler's thesis in implementation. There is also a relatively insignificant overhead from
+using an Exokernel based approach, and I leave future work to compare it to monolithic kernels
+for relative overhead costs introduced by each approach. This demonstrates the feasibility of an
+Exokernel based approach for research kernels, as they are relatively straightforward to
+implement without additional baggage, such as that imposed by Linux, while allowing for focusing
+on specific components of the kernel. Hopefully this spurs further research in alternative
+kernel design and modular kernel components which can easily be interchanged.
+
+\section{Acknowledgements}
+
+Thanks to Professor Levy for bailing me out with the device driver. Dealing with QEMU, PCI, and
+VirtIO was an experience, and I'm not sure if I learned principles which are generally
+applicable, but I definitely had a fun time dealing with low-level annoyances.
 
 %-------------------------------------------------------------------------------
 \bibliographystyle{plain}
@@ -338,7 +471,6 @@ metadata to disk after every write is quite high.
   year = {2005},
   publisher = {USENIX Association},
   address = {USA},
-  abstract = {We present the internals of QEMU, a fast machine emulator using an original portable dynamic translator. It emulates several CPUs (x86, PowerPC, ARM and Sparc) on several hosts (x86, PowerPC, ARM, Sparc, Alpha and MIPS). QEMU supports full system emulation in which a complete and unmodified operating system is run in a virtual machine and Linux user mode emulation where a Linux process compiled for one target CPU can be run on another CPU.},
   booktitle = {Proceedings of the Annual Conference on USENIX Annual Technical Conference},
   pages = {41},
   numpages = {1},
@@ -372,6 +504,46 @@ metadata to disk after every write is quite high.
   url = {https://www.usenix.org/conference/2005-usenix-annual-technical-conference/qemu-fast-and-portable-dynamic-translator},
   publisher = {{USENIX} Association},
   month = apr,
+}
+@inproceedings{proto_exo,
+  title={The design and implementation of a prototype exokernel operating system},
+  author={D. Engler},
+  year={1995}
+}
+@article{microkernel,
+  author = {Liedtke, Jochen},
+  title = {Toward Real Microkernels},
+  year = {1996},
+  issue_date = {Sept. 1996},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  volume = {39},
+  number = {9},
+  issn = {0001-0782},
+  url = {https://doi.org/10.1145/234215.234473},
+  doi = {10.1145/234215.234473},
+  journal = {Commun. ACM},
+  month = sep,
+  pages = {70–77},
+  numpages = {8}
+}
+@article{virtio,
+  author = {Russell, Rusty},
+  title = {Virtio: Towards a De-Facto Standard for Virtual I/O Devices},
+  year = {2008},
+  issue_date = {July 2008},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  volume = {42},
+  number = {5},
+  issn = {0163-5980},
+  url = {https://doi.org/10.1145/1400097.1400108},
+  doi = {10.1145/1400097.1400108},
+  journal = {SIGOPS Oper. Syst. Rev.},
+  month = jul,
+  pages = {95–103},
+  numpages = {9},
+  keywords = {I/O, virtio_pci, KVM, virtualization, vring, Linux, lguest, ring buffer, virtio}
 }
 \end{filecontents}
 

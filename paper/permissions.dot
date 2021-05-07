@@ -1,0 +1,12 @@
+digraph {
+  labelloc="t";
+  label="Checks for Performing Operations Through the GBI";
+  node [shape=box]
+  "Has Metadata Handle" -> "Requests Block N & Has N Owned Blocks" [label="Yes"]
+  "Has Metadata Handle" -> "Req. Metadata & Blocks from GBI" [label="No"]
+  "Requests Block N & Has N Owned Blocks" -> "Insufficient Blocks" [label="No"]
+  "Insufficient Blocks" -> "Req. Metadata & Blocks from GBI" [label="Req. Blocks"]
+  "Req. Metadata & Blocks from GBI" -> "Has Metadata Handle" [label="Retry"]
+  "Requests Block N & Has N Owned Blocks" -> "Read/Write to Device" [label="Yes"]
+  {rank=same;"Requests Block N & Has N Owned Blocks" "Req. Metadata & Blocks from GBI"}
+}

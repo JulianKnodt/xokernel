@@ -163,6 +163,8 @@ fs_bench!(bench_seek, |gfs, b| {
   let fd = gfs
     .open(root_dir_fd, &["empty.txt"], fs::FileMode::RW)
     .expect("Failed to open");
+  let data = [8; 512];
+  gfs.write(fd, &data).expect("Failed to write");
   b.iter(|| {
     gfs
       .seek(black_box(fd), black_box(fs::SeekFrom::Start(0)))
@@ -186,13 +188,60 @@ fs_bench!(bench_write_seek, |gfs, b| {
   });
 });
 
+fs_bench!(bench_seek_read, |gfs, b| {
+  let root_dir_fd = gfs
+    .root_dir(fs::FileMode::W)
+    .expect("failed to open root dir");
+  let fd = gfs
+    .open(root_dir_fd, &["empty.txt"], fs::FileMode::RW)
+    .expect("Failed to open");
+
+  let mut buf = [8; 512];
+  gfs.write(fd, &mut buf).expect("Failed to read");
+  b.iter(|| {
+    gfs
+      .seek(fd, fs::SeekFrom::Start(0))
+      .expect("Failed to seek");
+    gfs.read(fd, &mut buf).expect("Failed to read");
+  });
+});
+
+fs_bench!(bench_open_unlink, |gfs, b| {
+  let root_dir_fd = gfs
+    .root_dir(fs::FileMode::RW)
+    .expect("failed to open root dir");
+  b.iter(|| {
+    let fd = gfs
+      .open(root_dir_fd, &["tmp.txt"], fs::FileMode::RW)
+      .expect("Failed to open");
+    gfs.unlink(root_dir_fd, &["tmp.txt"])
+      .expect("Failed to unlink");
+    gfs.close(fd).expect("Failed to close");
+  });
+});
+
+fs_bench!(bench_open_close, |gfs, b| {
+  let root_dir_fd = gfs
+    .root_dir(fs::FileMode::RW)
+    .expect("failed to open root dir");
+  let fd = gfs
+    .open(root_dir_fd, &["tmp.txt"], fs::FileMode::RW)
+    .expect("Failed to open");
+  b.iter(|| {
+    let fd = gfs
+      .open(root_dir_fd, &["tmp.txt"], fs::FileMode::RW)
+      .expect("Failed to open");
+    gfs.close(fd).expect("Failed to close");
+  });
+});
+
 use std::{
   fs::File,
-  io::{self, Seek, Write},
+  io::{self, Seek, Write, Read},
 };
 #[bench]
 fn bench_linux_seek(b: &mut Bencher) {
-  let file_name = "linux_empty.txt";
+  let file_name = "linux_s.txt";
   let mut f = File::create(file_name).expect("Failed to open");
   let data = [8; 512];
   b.iter(|| {
@@ -203,7 +252,7 @@ fn bench_linux_seek(b: &mut Bencher) {
 
 #[bench]
 fn bench_linux_write_seek(b: &mut Bencher) {
-  let file_name = "linux_empty.txt";
+  let file_name = "linux_ws.txt";
   let mut f = File::create(file_name).expect("Failed to open");
   let data = black_box([8; 512]);
   b.iter(|| {
@@ -211,4 +260,55 @@ fn bench_linux_write_seek(b: &mut Bencher) {
     f.seek(io::SeekFrom::Start(0)).expect("Failed to seek");
   });
   std::fs::remove_file(file_name);
+}
+
+#[bench]
+fn bench_linux_seek_read(b: &mut Bencher) {
+  let file_name = "linux_sr.txt";
+  let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(file_name)
+            .expect("Failed to open");
+  let mut data = black_box([8; 512]);
+  f.write(&data).expect("Failed to write");
+  b.iter(|| {
+    f.seek(io::SeekFrom::Start(0)).expect("Failed to seek");
+    f.read(&mut data).expect("Failed to read");
+  });
+  std::fs::remove_file(file_name);
+}
+
+#[bench]
+fn bench_linux_open_close(b: &mut Bencher) {
+  let file_name = "tmp_linux.txt";
+  let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(file_name)
+            .expect("Failed to open");
+  b.iter(|| {
+    let mut f = std::fs::OpenOptions::new()
+              .read(true)
+              .write(true)
+              .create(false)
+              .open(file_name)
+              .expect("Failed to open");
+  });
+}
+
+#[bench]
+fn bench_linux_open_unlink(b: &mut Bencher) {
+  let file_name = "tmp_linux.txt";
+  b.iter(|| {
+    let mut f = std::fs::OpenOptions::new()
+              .read(true)
+              .write(true)
+              .create(true)
+              .open(file_name)
+              .expect("Failed to open");
+    std::fs::remove_file(file_name);
+  });
 }
